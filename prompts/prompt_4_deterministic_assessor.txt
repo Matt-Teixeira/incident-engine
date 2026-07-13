@@ -1,0 +1,47 @@
+Phase 4 - Deterministic Assessor (L3)
+
+Goal:
+Assess each incident deterministically - severity, category, recommended action, confidence,
+reasons - via a pure assess(dossier) function, behind a pluggable seam that a future LLM
+could implement without reworking the pipeline.
+
+Scope:
+- domain/assessor/: contract.js (JSDoc typedefs for the dossier input and the AssessResult
+  output), rules.js (the deterministic implementation), index.js (selects impl by
+  ASSESSOR_KIND, default 'rules', stamps assessor_kind on the incident).
+- assess(dossier) -> { severity: critical|high|medium|low|info, category, recommendedAction?,
+  confidence: 0..1, reasons: string[] }. PURE: no DB handle, no clock, no network inside.
+  Make it async from day one so an LLM impl needs no signature change.
+- Rules table keyed off classify output + blast radius: credentials/host_key_changed/
+  manual_intervention -> high (needs human); host_unreachable/connection_timeout with large
+  systems[] -> high else medium; *_partial (successful_acquisition families) -> low/info;
+  'unknown' -> medium, confidence ~0.3, reason "unclassified - needs pattern". Every branch
+  pushes a reason. recommendedAction maps from category.
+- jobs/assess (assessment step): assemble a plain dossier per touched incident, call await
+  assess(dossier), write severity/confidence/assessment(JSONB reasons+action)/assessor_kind.
+
+Non-goals:
+- NO LLM implementation (only the rules impl + the seam). The assessor must NOT set incident
+  state or perform auto-close (that stays deterministic, Phase 5). No writes outside incidents.
+
+Expected files / layers:
+- domain/assessor/{contract,rules,index}.js, jobs/assess/* (assessment step), test/
+  assessor-rules.test.js.
+
+Expected validation:
+- node --test: a dossier->result table covering every severity branch and the unknown path;
+  determinism (same dossier -> same result); assess is pure (no I/O).
+- Live smoke: after aggregate, run assess -> incidents get severity/confidence/assessment;
+  re-run -> stable results, assessor_kind='rules'.
+
+Write-isolation / least-privilege / idempotency / determinism constraints:
+- assess is pure and deterministic; ASSESSOR_KIND seam present; no LLM in the critical path.
+- Writes only the assessment columns on incidents.incidents.
+
+Schema assumptions to confirm live (Step 2):
+- None new (reads incidents.incidents produced in Phase 3).
+
+Review questions:
+- Is assess() genuinely pure (unit-testable with injected dossiers, no I/O)?
+- Does the seam let an LLM impl drop in behind the same async signature, advisory-only?
+- Is every branch reasoned and confidence-scored? Is 'unknown' handled safely?

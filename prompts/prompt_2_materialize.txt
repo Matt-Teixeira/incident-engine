@@ -1,0 +1,54 @@
+Phase 2 - Materialize (L0)
+
+Goal:
+Flatten the source error stream into incidents.error_events - one row per warn/error event,
+fingerprinted and classified - incrementally and idempotently, reading warn_error_logs only.
+
+Scope:
+- jobs/materialize: read the 'util.app_run_logs' watermark from incidents.pipeline_state
+  (epoch default); capture a fixed nowSnapshot=now(); scan
+    SELECT run_id, app_name, inserted_at, warn_error_logs
+    FROM util.app_run_logs
+    WHERE inserted_at > (watermark - overlap) AND inserted_at <= nowSnapshot
+      AND app_name IN (the producing apps) AND warn_error_logs IS NOT NULL
+    ORDER BY inserted_at
+  (partition-pruned; warn_error_logs ONLY - never verbose_log).
+- Flatten each event at array index i: extract top-level type/func/tag/err_msg/dt and
+  note.sme/job_id/message; compute fingerprint and classify at materialize time.
+- domain/ (pure, unit-tested): normalize.js (scrub IPs/paths/ids/timestamps -> placeholders,
+  frozen golden contract), fingerprint.js (sha1(app|func|tag|type|normalize(err_msg||
+  note.message)) + FP_VERSION), classify.js (thin wrapper over the copied connection_regex.js;
+  first-match-wins; 'unknown' fallback), entity.js (sme -> job_id -> system_id -> '__global__').
+- Copy /opt/apps/data_acquisition/util/tools/connection_regex.js into utils/classify/.
+- Bulk insert via pgp.helpers.insert(rows, colSet) + ON CONFLICT (run_id,event_ord) DO
+  NOTHING, chunked by MATERIALIZE_BATCH_ROWS.
+- Advance the watermark to nowSnapshot in the SAME transaction as the inserts.
+
+Non-goals:
+- No aggregation into incidents.incidents (Phase 3). No assessor. No verbose_log. No writes
+  outside incidents.
+
+Expected files / layers:
+- jobs/materialize/*, domain/normalize.js, domain/fingerprint.js, domain/classify.js,
+  domain/entity.js, utils/classify/connection_regex.js, utils/db/queries/*, test/*.
+
+Expected validation:
+- node --test: normalize/fingerprint/classify/entity golden + stability tests.
+- Live smoke: materialize a narrow window -> error_events count ~= scanned source event
+  count; re-run -> count unchanged (idempotent). Confirm no verbose_log in the SQL (grep +
+  EXPLAIN shows Index Scan on the monthly partition, warn_error_logs only).
+- Sanity: distinct-fingerprint / event ratio is reasonable; GE (no err_msg) groups sanely.
+
+Write-isolation / least-privilege / idempotency constraints:
+- Writes only incidents.error_events + pipeline_state; source is SELECT-only.
+- Re-run proven no-op; watermark advances only within nowSnapshot; overlap absorbs skew.
+
+Schema assumptions to confirm live (Step 2):
+- warn_error_logs event shape per producing app (top-level fields; note.sme/job_id/message
+  presence and sparsity, esp. hhm_rpp_ge err_msg=0%). Which app_names actually emit events.
+
+Review questions:
+- Is verbose_log never touched? Is the source scan partition-pruned?
+- Is the fingerprint stable and FP_VERSION-versioned? Is normalize.js frozen + golden-tested?
+- Is re-running exactly idempotent (ON CONFLICT + watermark-in-transaction)?
+- Does classify.js reproduce connection_regex.js first-match-wins ordering?

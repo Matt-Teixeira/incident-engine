@@ -1,0 +1,47 @@
+Phase 3 - Aggregate Incidents (L1/L2)
+
+Goal:
+Roll error_events up into incidents.incidents - one row per (fingerprint, entity) - with
+occurrence count, cross-app blast radius, and best-effort enrichment.
+
+Scope:
+- jobs/assess (aggregation half): read new error_events since the 'incidents.error_events'
+  watermark (second pipeline_state row, on inserted_at); group by (fingerprint, entity):
+  count, min(dt)/max(dt), array_agg(distinct src_app_name) as apps, array_agg(distinct
+  system_id) as systems, a representative event (sample_run_id, sample_message).
+- UPSERT into incidents.incidents ON CONFLICT (fingerprint, entity) DO UPDATE:
+  occurrence_count += batch count, last_seen = GREATEST, first_seen = LEAST, array-union
+  apps/systems, refresh category/error_type/phase/func from the representative event.
+- Enrichment: LEFT JOIN stats.acquisition_history on system_id (and run_id when it matches)
+  to fill phase/modality/manufacturer and corroborate category when classify returned
+  'unknown'. Best-effort; classify remains primary.
+- Prefer SQL-side aggregation (INSERT ... SELECT ... GROUP BY ... ON CONFLICT) since
+  fingerprint/category are already on error_events from Phase 2.
+
+Non-goals:
+- No severity/state/assessment yet (Phase 4). No auto-close (Phase 5). No writes outside
+  incidents. No LLM.
+
+Expected files / layers:
+- jobs/assess/* (aggregate step), utils/db/queries/incidents.js, utils/db/queries/
+  enrichment.js, lib/incidents shaping if any pure logic, test/*.
+
+Expected validation:
+- Live smoke: after materialize, run aggregate -> incidents rows created, one per
+  (fingerprint, entity), with plausible apps[]/systems[]/occurrence_count; re-run -> counts
+  advance, NO duplicate incident rows (UNIQUE(fingerprint,entity) holds).
+- Cross-app: a fingerprint seen under >1 app shows apps.length > 1.
+
+Write-isolation / least-privilege / idempotency constraints:
+- Writes only incidents.incidents + its watermark; stats.acquisition_history SELECT-only.
+- Re-run idempotent via ON CONFLICT + watermark.
+
+Schema assumptions to confirm live (Step 2):
+- stats.acquisition_history join keys (system_id VARCHAR(8), run_id UUID) and the presence
+  of error_category/phase/modality/manufacturer for enrichment.
+
+Review questions:
+- Is (fingerprint, entity) the correct grouping grain, and does UNIQUE hold on re-run?
+- Is the entity fallback (sme -> job_id -> system_id -> __global__) producing sane bucket
+  sizes (validate __global__ volume)?
+- Is enrichment strictly best-effort (never overwrites a confident classify with a null)?

@@ -1,0 +1,60 @@
+Phase 1 - App Skeleton + Schema + Role Provisioning
+
+Goal:
+Stand up a runnable cron-batch app skeleton (mirroring data_acquisition), create and
+provision the owned `incidents` schema + least-privilege `incident_engine_rw` role, and
+switch .env off the borrowed read-only role - proven by a self-log smoke run.
+
+Scope:
+- Scaffold (CommonJS, mirror /opt/apps/data_acquisition):
+  - package.json (no "type"; scripts: materialize/assess/run/test), index.js (switch
+    dispatch + run-log lifecycle: makeAppRunLog -> onBoot -> runJob(switch) -> addRunSummary
+    -> dbInsertLogEvents -> writeLogEvents).
+  - utils/logger/log.js + enums.js and utils/db/pg-pool.js copied from data_acquisition
+    (collapse to a single utils/ tree; PGHOST||PG_HOST fallback + buildSsl).
+  - utils/db/sql/pg-helpers.js with ColumnSets for incidents.error_events + incidents.incidents.
+  - docker-compose.yaml (pg_net only, no redis, no port, user 105:987, node_modules cache
+    /opt/resources/node_mod_cache/incident-engine, RUN_LOGS_DIR bind), .env.example.
+  - a `noop`/`run` job stub so the lifecycle can execute end-to-end.
+- db/schema.sql: incidents schema + error_events, incidents, pipeline_state (per
+  docs/incidents-schema.md). House DDL style: BIGSERIAL, TIMESTAMPTZ DEFAULT NOW(), BRIN on
+  time cols, NO partitioning. Declare all columns up front.
+- db/setup-owner-role.sql: incident_engine_rw (owns incidents; fail-closed SELECT on
+  util.app_run_logs + stats.acquisition_history; INSERT on util.app_run_logs for self-log),
+  idempotent, -v pw=..., safe role attrs forced. Copy the fail-closed REVOKE->GRANT->DO-verify
+  pattern from /opt/apps/ops-dashboard/db/setup-readonly-role.sql.
+- Provision: apply schema.sql + setup-owner-role.sql as superuser; update .env
+  (PGUSER=incident_engine_rw, PGPASSWORD=...).
+
+Non-goals:
+- No materialize/aggregate/assess logic yet (Phases 2-5). No reading of warn_error_logs
+  content beyond the self-log write.
+- No verbose_log access, ever. No writes outside the incidents schema (besides the self-log
+  INSERT). No LLM. No dashboard changes.
+
+Expected files / layers:
+- package.json, index.js, utils/logger/*, utils/db/*, db/schema.sql, db/setup-owner-role.sql,
+  docker-compose.yaml, .env.example, test/ (smoke of the pure helpers if any).
+
+Expected validation:
+- Apply schema + role as superuser; verify grants effective and fail-closed (SET ROLE
+  incident_engine_rw: can SELECT source/oracle, can CREATE/INSERT in incidents, is DENIED
+  write to util/stats/alert beyond the self-log INSERT).
+- docker compose run --rm app node index.js run  -> exits 0 and writes a self-log row into
+  util.app_run_logs under app_name='incident-engine'.
+
+Write-isolation / least-privilege / idempotency constraints:
+- All writes confined to incidents + the self-log INSERT. Role is not a superuser.
+- Grants applied fail-closed and proven by the DO-verify block.
+
+Schema assumptions to confirm live (Step 2):
+- util.app_run_logs columns/types (json, partitioned, app_name), stats.acquisition_history
+  columns (successful_acquisition, error_category, system_id, run_id) - confirm before the
+  ColumnSets/DDL reference them.
+
+Review questions:
+- Does the role deny every write outside incidents + the self-log, provably (DO-verify)?
+- Does the skeleton match data_acquisition house style (CJS, positional logger, pool
+  fallback, pgp.helpers, batch one-shot, no port)?
+- Is .env switched off ops_dashboard_ro, with no secret in any committed file?
+- Does schema.sql match docs/incidents-schema.md exactly?

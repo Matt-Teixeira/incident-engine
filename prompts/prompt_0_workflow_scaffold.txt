@@ -1,0 +1,46 @@
+Phase 0 - Workflow Scaffold
+
+Goal:
+Establish a measured, phase-based, prompt-driven development workflow for incident-engine
+(modeled on ops-dashboard's) so future work is repeatable and reviewable, and encode the
+app's durable rules for its WRITER identity and deterministic, no-LLM assessment.
+
+Scope:
+- Add markdown/ process docs: FLOW, ARCHITECTURE_PRINCIPLES, PROMPTS, PHASE_TEMPLATE,
+  PHASE_LOG, REVIEW_CHECKLIST, ENVIRONMENT, DEPLOYMENT.
+- Add prompts/ with this scaffold prompt and the planned phase prompts (1-5).
+- Add notes/ for review handoffs and results.
+- Add docs/ with this app's own contracts (error-taxonomy, incidents-schema) + a pointer to
+  the shared suite docs in ops-dashboard/docs.
+- Add CLAUDE.md orientation and flesh out README.md.
+- Encode the durable facts: writer-owns-incidents-schema (not read-only), deterministic
+  pluggable assessment (no LLM), warn_error_logs-only (no verbose_log detoast), idempotent
+  watermark + ON CONFLICT, least-privilege incident_engine_rw role, data_acquisition house
+  style, cron-batch deploy.
+
+Non-goals:
+- Do not write runtime/app code (no index.js, jobs, db/schema.sql, or role SQL yet).
+- Do not edit .env or expose any secret values.
+- Do not create the incidents schema, roles, or run any DB statements.
+- Do not duplicate the shared suite docs (logging-schema, infra-conventions) - reference them.
+
+Expected files / layers:
+- CLAUDE.md, README.md, markdown/*, prompts/*, notes/*, docs/* (new, repo root).
+
+Expected validation:
+- Confirm the workflow files exist and cross-reference correctly.
+- git status review. No app build required (docs-only).
+
+Write-isolation / least-privilege / idempotency constraints:
+- None touched (documentation only). The rules are DEFINED here; enforcement lands in Phase 1+.
+
+Schema assumptions to confirm live:
+- None (no query changes). Schema facts in docs/ are carried from the approved plan and are
+  re-confirmed in the phase that first uses them.
+
+Review questions:
+- Does the workflow define phase boundaries and the review gate clearly?
+- Are the durable rules (write-isolation, determinism/no-LLM, idempotency, least privilege,
+  warn_error_logs-only) explicit and adapted from ops-dashboard's read-only stance?
+- Is the roadmap (Phases 1-5) scoped in a safe, reviewable, bottom-up order?
+- Does the system reference the shared suite docs rather than duplicating them?

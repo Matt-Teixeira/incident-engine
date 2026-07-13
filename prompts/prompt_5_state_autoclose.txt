@@ -1,0 +1,52 @@
+Phase 5 - State Machine + Auto-Close (L5)
+
+Goal:
+Give incidents a deterministic lifecycle and auto-resolve them when the underlying system
+recovers - using stats.acquisition_history.successful_acquisition as the recovery oracle -
+so the incident list reflects current reality without a human closing each one.
+
+Scope:
+- State machine on incidents.incidents.state: open -> acknowledged -> recurring -> resolved
+  -> suppressed. Engine-driven transitions only:
+  - new (fingerprint, entity) -> open.
+  - re-occurrence while open/acknowledged -> bump occurrence_count/last_seen; cross a
+    recurrence threshold or multi-run span -> recurring.
+  - auto-close: for each open/recurring incident with resolvable systems[], if
+    stats.acquisition_history has successful_acquisition=true for one of those system_ids
+    with capture_datetime (or inserted_at) LATER than the incident's last_seen -> state=
+    resolved, resolved_at=now(), resolved_reason='auto_recovery'. Deterministic; no human/LLM.
+  - re-open: a resolved incident whose (fingerprint, entity) recurs AFTER resolved_at ->
+    open/recurring (prevents a stale auto-close from hiding a real recurrence).
+- acknowledged and suppressed are reserved for a future human/dashboard action - the engine
+  defines but never sets them this phase.
+- jobs/assess (state step): run after assessment; pure transition logic in domain/state.js
+  (given incident + recovery facts -> next state), DB I/O in the job.
+
+Non-goals:
+- NO auto-remediation (L4): action_state/action_ref columns exist but are never written.
+- No notifications. No human-transition UI. No writes outside incidents. No LLM.
+
+Expected files / layers:
+- domain/state.js (pure transition function), jobs/assess/* (state step),
+  utils/db/queries/recovery.js (the oracle lookup), test/state.test.js.
+
+Expected validation:
+- node --test: transition table incl. auto-close given a mock {successful_acquisition:true,
+  capture_datetime > last_seen}, and re-open on post-resolve recurrence; suppressed/
+  acknowledged never engine-set.
+- Live smoke: pick a system_id with a later successful_acquisition -> its incident flips to
+  resolved/auto_recovery; a still-failing system stays open/recurring. Re-run idempotent.
+
+Write-isolation / least-privilege / idempotency / determinism constraints:
+- domain/state.js pure; state transitions deterministic. stats.acquisition_history
+  SELECT-only. Writes only state columns on incidents.incidents. Re-run idempotent.
+
+Schema assumptions to confirm live (Step 2):
+- stats.acquisition_history.successful_acquisition semantics and the timestamp used for
+  "later than last_seen" (capture_datetime vs inserted_at) - confirm which reliably orders
+  recovery after the incident.
+
+Review questions:
+- Is auto-close strictly deterministic and correctly ordered (recovery AFTER last_seen)?
+- Does re-open prevent stale auto-closes from masking recurrences?
+- Are acknowledged/suppressed and action_* left untouched by the engine?
