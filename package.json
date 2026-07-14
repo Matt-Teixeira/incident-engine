@@ -1,0 +1,21 @@
+{
+  "name": "incident-engine",
+  "version": "1.0.0",
+  "description": "Deterministic error→incident pipeline over util.app_run_logs",
+  "main": "index.js",
+  "scripts": {
+    "materialize": "node index.js materialize",
+    "assess": "node index.js assess",
+    "run": "node index.js run",
+    "test": "node --test"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "dotenv": "^16.0.3",
+    "pg": "^8.8.0",
+    "pg-promise": "^10.15.4",
+    "uuid": "^9.0.1"
+  }
+}

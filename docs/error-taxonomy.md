@@ -12,8 +12,11 @@ the pipeline already computes onto `stats.acquisition_history.error_category` an
 
 ## How the classifier is used
 
-- Input text = `err_msg || note.message` from a `warn_error_logs` event (`err_msg` is
-  sparse — 0% on `hhm_rpp_ge` — so `note.message` is the fallback).
+- Input text = `err_msg || note.message || note.txt || ''` from a `warn_error_logs` event.
+  Live-verified 2026-07-14: `err_msg` is sparse (0% on `hhm_rpp_ge`, 55% on
+  `data_acquisition`); `note.message` is the primary fallback (100% on GE); `note.txt` is
+  a `data_acquisition`-only second fallback (~15% of its events, e.g.
+  `{txt: "NO TUNNEL FOUND"}`) — the three are nearly complementary per app.
 - `connection_regexes` is an **ordered** array; **first match wins**. Ordering places
   root-cause signals (SSH auth, host-key) above downstream symptoms (generic "connection
   unexpectedly closed"). Patterns are **not** `/g` (stateful `.test()` on shared objects).

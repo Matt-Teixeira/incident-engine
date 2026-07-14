@@ -28,7 +28,10 @@ Read-Only Rule.)
 - It writes **only** the `incidents` schema, which it **owns**.
 - It reads `util.app_run_logs` and `stats.acquisition_history` **read-only**.
 - It self-logs its own runs into `util.app_run_logs` under **`app_name = "incident-engine"`
-  only** — the single write outside `incidents`, via `INSERT` on that table.
+  only** — the single write outside `incidents`, via `INSERT` on the
+  `util.incident_engine_self_log` view (postgres-owned, `WITH CHECK OPTION`, pinned to
+  this app's `app_name`), so the database itself rejects a mis-attributed row. The role
+  has no `INSERT` on the base table.
 - No `INSERT`/`UPDATE`/`DELETE`/DDL against any other pipeline-owned table (`alert.*`,
   `stats.*`, other apps' `util` rows).
 - Enforce this at the credential layer (see Least-Privilege Rule), so a bug cannot write
@@ -59,7 +62,10 @@ The source is `util.app_run_logs`; confirmed facts (re-verify if the table chang
 - Only a few apps emit warn/error events (`data_acquisition`, `hhm_rpp_ge`,
   `hhm_rpp_philips`). Event fields are **top-level** (`type`, `func`, `tag`, `err_msg`,
   `dt`) with a nested `note`. `err_msg` is sparse (0% on `hhm_rpp_ge`); fall back to
-  `note.message`. `note.sme` (~64% present) is the cross-app equipment key.
+  `note.message`, then `note.txt` (`data_acquisition`-only). `note.sme` (~46–84% by app)
+  is the cross-app equipment key. **This app also writes this table** (self-log), so
+  every source scan must exclude `app_name = 'incident-engine'` — ingesting our own
+  errors is a feedback loop, not a feature (unless a future phase decides otherwise).
 - **Source retention is short (~7 days)**, so this app **persists its own durable
   rollups** rather than assuming long history upstream.
 
@@ -83,11 +89,15 @@ Every job is re-runnable with no double-count.
 
 The app connects as a dedicated role **`incident_engine_rw`**. Its grants are: **owns
 schema `incidents`** (full DML/DDL there); `CONNECT`; `SELECT` on exactly
-`util.app_run_logs` and `stats.acquisition_history`; `INSERT` on `util.app_run_logs`
-(self-log only). Nothing else — no other object in any schema, no writes outside
-`incidents` + the self-log INSERT. The external `SELECT` grants are applied **fail-closed**
-(the setup script REVOKEs, re-grants only the intended privileges, then a `DO` block RAISEs
-if any other effective privilege remains), so re-running the script *proves* the surface.
+`util.app_run_logs` and `stats.acquisition_history`; `INSERT` only through the
+`util.incident_engine_self_log` check-option view (self-log; no `INSERT` on the base
+table). Nothing else — no other object in any schema, no writes outside `incidents` +
+the self-log INSERT. The external grants are applied **fail-closed**: the setup script
+REVOKEs (tables *and* sequences), re-grants only the intended privileges, then `DO`
+blocks RAISE if any other effective privilege remains — including column-only grants,
+sequence privileges, and grants inherited via `PUBLIC` — finishing with a
+**database-wide allowlist audit** over every non-system schema. Re-running the script
+*proves* the surface.
 Never ship the app pointed at a superuser. Role setup lives in `db/setup-owner-role.sql`
 (idempotent; re-run as a superuser to apply changes before deploying code that needs them).
 
@@ -96,7 +106,9 @@ Never ship the app pointed at a superuser. Role setup lives in `db/setup-owner-r
 Incidents are only as good as their grouping key.
 
 - The fingerprint is `sha1(src_app_name | func | tag | type | normalize(err_msg ||
-  note.message))`, carrying a `FP_VERSION` constant so a formula change is detectable.
+  note.message || note.txt))`, carrying a `FP_VERSION` constant so a formula change is
+  detectable. (`note.txt` added pre-implementation, 2026-07-14: it is
+  `data_acquisition`'s only text on ~15% of its events.)
 - `normalize.js` (scrubbing IPs / paths / ids / timestamps into placeholders) is a
   **frozen, golden-tested contract** — changing it changes every fingerprint, so it moves
   only in a deliberate, logged phase with `FP_VERSION` bumped.

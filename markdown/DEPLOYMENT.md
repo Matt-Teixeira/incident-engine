@@ -16,9 +16,11 @@ superuser (e.g. `docker exec -i pg_db psql -U postgres -d staging`):
 
 1. `db/schema.sql` — creates the `incidents` schema, tables, indexes, and `pipeline_state`.
 2. `db/setup-owner-role.sql` — creates `incident_engine_rw` (owns `incidents`; fail-closed
-   `SELECT` on `util.app_run_logs` + `stats.acquisition_history`; `INSERT` on
-   `util.app_run_logs` for self-log). Idempotent; re-run to apply grant changes **before**
-   deploying code that needs them.
+   `SELECT` on `util.app_run_logs` + `stats.acquisition_history`; `INSERT` via the
+   `util.incident_engine_self_log` check-option view for self-log — no base-table INSERT).
+   Ends with a database-wide allowlist audit that aborts on any unexpected effective
+   privilege. Idempotent; re-run to apply grant changes **before** deploying code that
+   needs them.
 3. Point `.env` at the role: `PGUSER=incident_engine_rw`, `PGPASSWORD=<the role's password>`.
 
 Re-run `db/setup-owner-role.sql` after any DB reset — a reset wipes schemas/grants (roles
@@ -62,6 +64,8 @@ Verify against the DB (as a superuser or the role):
 - a self-log row exists: `SELECT max(inserted_at) FROM util.app_run_logs WHERE app_name='incident-engine';`
 - the role is denied writes outside `incidents`:
   `SET ROLE incident_engine_rw; INSERT INTO stats.acquisition_history ...;  -- expect: permission denied`
+- the self-log identity is DB-enforced:
+  `INSERT INTO util.incident_engine_self_log(app_name, ...) VALUES ('data_acquisition', ...);  -- expect: check option violation`
 
 ## Rollback
 

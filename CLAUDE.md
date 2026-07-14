@@ -42,7 +42,8 @@ writer** — but a disciplined one:
 - It **owns** the `incidents` schema and writes **only** there.
 - It reads `util.app_run_logs` and `stats.acquisition_history` **read-only**.
 - It self-logs its own runs into `util.app_run_logs` under `app_name = "incident-engine"`
-  (INSERT on that table only — the one write outside `incidents`).
+  — the one write outside `incidents`, via the `util.incident_engine_self_log`
+  check-option view, so the DB rejects any other `app_name`.
 - It **never** writes `util`/`alert`/`stats` data, and connects as a dedicated
   least-privilege role `incident_engine_rw`, never a superuser.
 

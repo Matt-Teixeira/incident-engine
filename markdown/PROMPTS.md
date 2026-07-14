@@ -46,6 +46,12 @@ Later, read-only insight moves to the operator surface: a **dashboard incidents 
 
 ## Not decided yet
 
+- whether/when to onboard **`acquisition-v2`** as a producing app: it writes
+  `util.app_run_logs` rows but (as of 2026-07-14) zero `warn_error_logs` events, and its
+  event shape is unverified — the Phase 2 `PRODUCING_APPS` allowlist excludes it until
+  this is decided (see `notes/phase_2_reevaluation.md`)
+- whether incident-engine ever **ingests its own** self-logged errors (self-monitoring);
+  excluded from the scan for now to avoid a feedback loop
 - job cadence: one `run` cron line (materialize→assess) vs. two staggered lines
 - `incidents.error_events` retention (BRIN + full history now; revisit detach/partitioning
   only if volume demands)
@@ -63,7 +69,7 @@ These are decided in future phases, not hidden inside unrelated edits.
 | Phase | Prompt file | Status | Notes |
 | ----- | ----------- | ------ | ----- |
 | 0 | `prompt_0_workflow_scaffold.txt` | Completed | This workflow system: `markdown/` docs, prompt roadmap, phase log, `docs/` contracts. Docs-only. |
-| 1 | `prompt_1_app_skeleton_provision.txt` | Planned | App skeleton (CJS `index.js` switch dispatch, `utils/logger`+`utils/db` copied from `data_acquisition`, `package.json`, `docker-compose.yaml`), `db/schema.sql`, `db/setup-owner-role.sql`; provision `incidents` schema + `incident_engine_rw` role + point `.env` at it; self-log smoke. |
+| 1 | `prompt_1_app_skeleton_provision.txt` | Completed | App skeleton (CJS `index.js` switch dispatch, `utils/logger`+`utils/db` copied from `data_acquisition`, `package.json`, `docker-compose.yaml`), `db/schema.sql`, `db/setup-owner-role.sql`; provision `incidents` schema + `incident_engine_rw` role + point `.env` at it; self-log smoke. |
 | 2 | `prompt_2_materialize.txt` | Planned | L0 materialize: watermark → scan `warn_error_logs` (partition-pruned, no `verbose_log`) → flatten + fingerprint + classify → `incidents.error_events`, idempotent `ON CONFLICT`. |
 | 3 | `prompt_3_aggregate_incidents.txt` | Planned | L1/L2 aggregate by `(fingerprint, entity)` → `incidents.incidents` (occurrence count, `apps[]`/`systems[]` blast radius, enrichment join to `stats.acquisition_history`). |
 | 4 | `prompt_4_deterministic_assessor.txt` | Planned | L3 assessor: pure `assess(dossier)` → severity/state/reasons; rules impl; pluggable `ASSESSOR_KIND` seam for a future LLM. |

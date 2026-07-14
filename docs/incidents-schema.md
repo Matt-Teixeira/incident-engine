@@ -24,7 +24,7 @@ One row per `warn_error_logs` event, fingerprinted + classified at materialize t
 | `sme` | VARCHAR(16) | `note.sme` — cross-app equipment key (~64% present) |
 | `job_id` | TEXT | `note.job_id` |
 | `system_id` | VARCHAR(8) | resolved when derivable (join key to stats/alert) |
-| `fingerprint` | CHAR(40) | `sha1(app\|func\|tag\|type\|normalize(err_msg\|\|note_message))` |
+| `fingerprint` | CHAR(40) | `sha1(app\|func\|tag\|type\|normalize(err_msg\|\|note.message\|\|note.txt))` |
 | `error_category` | VARCHAR(64) | classify output (`unknown` when unmatched) |
 | `error_type` | VARCHAR(16) | connection / key / credentials / file |
 | `phase` | VARCHAR(32) | best-effort from enrichment; default '' |

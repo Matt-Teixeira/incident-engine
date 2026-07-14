@@ -138,9 +138,14 @@ fingerprint, the watermark, or deployment.
 ## Step 7 — Review And Log
 
 - run through `markdown/REVIEW_CHECKLIST.md`
-- add a phase entry to `markdown/PHASE_LOG.md` (use `PHASE_TEMPLATE.md`)
+- generate `notes/codex_handoff_phase_X.md` — the external-reviewer (Codex) briefing.
+  **Mandatory after every implementation phase** (docs-only phases may skip it). Model
+  it on `/opt/apps/ops-dashboard/docs/code-review-handoff.md`; required sections are
+  listed in `notes/README.md`
+- add a phase entry to `markdown/PHASE_LOG.md` (use `PHASE_TEMPLATE.md`), linking the
+  handoff under Review Artifacts
 - update `markdown/PROMPTS.md` status
-- store any review handoff/results in `notes/`
+- store returned findings as `notes/review_results_phase_X.md`
 
 ## Step 8 — Commit Readiness
 

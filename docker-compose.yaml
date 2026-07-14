@@ -1,0 +1,29 @@
+# incident-engine — cron-batch one-shot (no server, no published port).
+# Invoke: docker compose run --rm app node index.js <materialize|assess|run>
+services:
+  app:
+    image: node:lts
+    user: "105:987"
+    working_dir: /workspace
+    env_file:
+      - .env
+    environment:
+      # Don't write into root's $HOME inside the image; use a tmp home
+      HOME: /tmp
+      # Keep npm's cache ephemeral (avoids permission issues on bind mounts)
+      NPM_CONFIG_CACHE: /tmp/.npm
+    volumes:
+      # Project source → live edit on host reflects in container
+      - ./:/workspace
+      # node_modules cache
+      - /opt/resources/node_mod_cache/incident-engine:/workspace/node_modules
+      # Centralized run logs (host:container bind spec, set in .env)
+      - ${RUN_LOGS_DIR}
+      # Shared PG SSL cert (read-only), for PG_SSLMODE=verify-*
+      - /opt/resources/ssl:/opt/resources/ssl:ro
+    networks:
+      - pg_net
+
+networks:
+  pg_net:
+    external: true

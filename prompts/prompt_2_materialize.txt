@@ -1,5 +1,9 @@
 Phase 2 - Materialize (L0)
 
+[Re-evaluated 2026-07-14 after Phase 1 — see notes/phase_2_reevaluation.md for the live
+data behind the changes: producer allowlist + self-log exclusion, note.txt text fallback,
+and Phase 1 conventions (throw-on-failure, dependency-free domain tests, existing ColumnSet).]
+
 Goal:
 Flatten the source error stream into incidents.error_events - one row per warn/error event,
 fingerprinted and classified - incrementally and idempotently, reading warn_error_logs only.
@@ -10,45 +14,89 @@ Scope:
     SELECT run_id, app_name, inserted_at, warn_error_logs
     FROM util.app_run_logs
     WHERE inserted_at > (watermark - overlap) AND inserted_at <= nowSnapshot
-      AND app_name IN (the producing apps) AND warn_error_logs IS NOT NULL
+      AND app_name IN (PRODUCING_APPS) AND warn_error_logs IS NOT NULL
     ORDER BY inserted_at
   (partition-pruned; warn_error_logs ONLY - never verbose_log).
-- Flatten each event at array index i: extract top-level type/func/tag/err_msg/dt and
-  note.sme/job_id/message; compute fingerprint and classify at materialize time.
-- domain/ (pure, unit-tested): normalize.js (scrub IPs/paths/ids/timestamps -> placeholders,
-  frozen golden contract), fingerprint.js (sha1(app|func|tag|type|normalize(err_msg||
-  note.message)) + FP_VERSION), classify.js (thin wrapper over the copied connection_regex.js;
-  first-match-wins; 'unknown' fallback), entity.js (sme -> job_id -> system_id -> '__global__').
+  PRODUCING_APPS is an explicit code constant: 'data_acquisition', 'hhm_rpp_ge',
+  'hhm_rpp_philips' (live-verified 2026-07-14: the only apps emitting events; ~25k/day).
+  - NEVER include 'incident-engine': this app self-logs its own WARN/ERROR events into
+    the same table (proven live in Phase 1), so an unfiltered scan ingests its own
+    errors as incidents - a feedback loop. Self-ingestion is a possible future
+    deliberate decision, not an accident of the scan.
+  - 'acquisition-v2' writes rows but zero warn_error_logs events so far; its event
+    shape is unverified. Excluded until onboarded deliberately (see PROMPTS.md
+    "Not decided yet"). ops-dashboard emits no events.
+- Flatten each event at array index i (event_ord=i): extract top-level
+  type/func/tag/err_msg/dt and note.sme/job_id/message; store the whole original event
+  as raw_event (JSONB); compute fingerprint and classify at materialize time.
+  - Event TEXT for fingerprint/classify = err_msg || note.message || note.txt || ''.
+    Live-verified 2026-07-14 (1-day window): the three fields are nearly complementary
+    on data_acquisition (err_msg 55%, note.message 29%, note.txt 15%); hhm_rpp_ge is
+    100% note.message (0% err_msg); hhm_rpp_philips is 32%/68%. note.txt is
+    data_acquisition-only (e.g. {txt:"NO TUNNEL FOUND"}) - without it ~15% of that
+    app's events would fingerprint on func/tag alone.
+  - The note_message COLUMN stores note.message only (per docs/incidents-schema.md);
+    the fallback chain is the fingerprint/classify INPUT, and raw_event keeps the rest.
+- domain/ (pure, unit-tested): normalize.js (scrub IPs/paths/ids/timestamps ->
+  placeholders, frozen golden contract), fingerprint.js (sha1(app|func|tag|type|
+  normalize(TEXT)) + FP_VERSION=1), classify.js (thin wrapper over the copied
+  connection_regex.js; first-match-wins; 'unknown' fallback), entity.js
+  (sme -> job_id -> system_id -> '__global__').
+  - domain/ and test/ stay DEPENDENCY-FREE (node builtins only, e.g. node:crypto for
+    sha1): the test command runs in a bare node:lts container without node_modules
+    (Phase 1 convention). DB access stays in jobs/ + utils/db/.
 - Copy /opt/apps/data_acquisition/util/tools/connection_regex.js into utils/classify/.
 - Bulk insert via pgp.helpers.insert(rows, colSet) + ON CONFLICT (run_id,event_ord) DO
-  NOTHING, chunked by MATERIALIZE_BATCH_ROWS.
+  NOTHING, chunked by MATERIALIZE_BATCH_ROWS. The ColumnSet already exists from Phase 1
+  (utils/db/sql/pg-helpers.js: pg_column_sets.incidents.error_events) - extend it only
+  if the flatten needs it, don't duplicate it.
 - Advance the watermark to nowSnapshot in the SAME transaction as the inserts.
+- Failure semantics (Phase 1 convention): a failed batch THROWS out of the job so the
+  run-log lifecycle records it and the process exits 1; the transaction rolls back, so
+  the watermark does not advance and the next run rescans. Defensive JSON handling:
+  a malformed event never crashes the batch (skip + WARN log event with run_id/ord).
+- First run note: watermark starts at epoch, but source retention is ~7 days, so the
+  initial scan is bounded by retention (~175k events) - chunking must handle it.
 
 Non-goals:
 - No aggregation into incidents.incidents (Phase 3). No assessor. No verbose_log. No writes
-  outside incidents.
+  outside incidents. No ingestion of incident-engine's own events, no acquisition-v2
+  onboarding (both are deliberate future decisions).
 
 Expected files / layers:
 - jobs/materialize/*, domain/normalize.js, domain/fingerprint.js, domain/classify.js,
   domain/entity.js, utils/classify/connection_regex.js, utils/db/queries/*, test/*.
 
 Expected validation:
-- node --test: normalize/fingerprint/classify/entity golden + stability tests.
+- node --test: normalize/fingerprint/classify/entity golden + stability tests
+  (dependency-free; runs in bare node:lts).
 - Live smoke: materialize a narrow window -> error_events count ~= scanned source event
   count; re-run -> count unchanged (idempotent). Confirm no verbose_log in the SQL (grep +
-  EXPLAIN shows Index Scan on the monthly partition, warn_error_logs only).
-- Sanity: distinct-fingerprint / event ratio is reasonable; GE (no err_msg) groups sanely.
+  EXPLAIN shows partition pruning on the monthly partitions, warn_error_logs only).
+- Failure path: force a mid-batch failure -> exit 1, watermark unchanged, re-run clean
+  (this also closes the exit-code smoke deferred from Phase 1).
+- Sanity: distinct-fingerprint / event ratio is reasonable; GE (no err_msg) groups sanely;
+  data_acquisition note.txt-only events (e.g. "NO TUNNEL FOUND") group by their text,
+  not into a func/tag-only bucket.
+- Per FLOW Step 7: notes/codex_handoff_phase_2.md before commit.
 
 Write-isolation / least-privilege / idempotency constraints:
 - Writes only incidents.error_events + pipeline_state; source is SELECT-only.
 - Re-run proven no-op; watermark advances only within nowSnapshot; overlap absorbs skew.
 
 Schema assumptions to confirm live (Step 2):
-- warn_error_logs event shape per producing app (top-level fields; note.sme/job_id/message
-  presence and sparsity, esp. hhm_rpp_ge err_msg=0%). Which app_names actually emit events.
+- warn_error_logs event shape per producing app (top-level fields; note.sme/job_id/
+  message/txt presence and sparsity - re-verify the 2026-07-14 stats above still hold,
+  esp. hhm_rpp_ge err_msg=0% and the data_acquisition err_msg/message/txt split).
+- Which app_names emit events (re-check acquisition-v2 is still silent; if it has begun
+  emitting, STOP and revisit the PRODUCING_APPS decision with the developer).
 
 Review questions:
 - Is verbose_log never touched? Is the source scan partition-pruned?
+- Is 'incident-engine' excluded from the scan (no self-ingestion loop)?
 - Is the fingerprint stable and FP_VERSION-versioned? Is normalize.js frozen + golden-tested?
+- Does the TEXT fallback chain match the documented contract (err_msg -> note.message ->
+  note.txt -> '')?
 - Is re-running exactly idempotent (ON CONFLICT + watermark-in-transaction)?
 - Does classify.js reproduce connection_regex.js first-match-wins ordering?
+- Does a failed batch exit 1 with the watermark unadvanced?

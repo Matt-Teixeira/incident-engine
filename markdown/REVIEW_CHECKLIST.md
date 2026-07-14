@@ -1,8 +1,10 @@
 # Review Checklist
 
 The quality gate run before any phase commits. Walk it explicitly; record the outcome in
-the phase's `PHASE_LOG.md` entry. (For a deep external review, generate a handoff in
-`notes/` modeled on `/opt/apps/ops-dashboard/docs/code-review-handoff.md`.)
+the phase's `PHASE_LOG.md` entry. Every implementation phase must also produce a Codex
+review handoff, `notes/codex_handoff_phase_X.md`, modeled on
+`/opt/apps/ops-dashboard/docs/code-review-handoff.md` (required sections in
+`notes/README.md`; docs-only phases may skip it).
 
 ## Phase Scope
 
@@ -11,6 +13,8 @@ the phase's `PHASE_LOG.md` entry. (For a deep external review, generate a handof
 - Were unrelated code, query, dependency, or deployment changes avoided?
 - Was `markdown/PROMPTS.md` status updated if it changed?
 - Was a `markdown/PHASE_LOG.md` entry added after implementation and validation?
+- Was `notes/codex_handoff_phase_X.md` generated (mandatory for implementation phases)
+  and linked from the phase's Review Artifacts?
 
 ## Write-Isolation & Least Privilege
 

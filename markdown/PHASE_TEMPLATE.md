@@ -21,7 +21,7 @@ Pending / commit SHA
 
 Review Artifacts:
 
-- Review handoff: `notes/review_handoff_phase_X.md`
+- Codex handoff: `notes/codex_handoff_phase_X.md` (mandatory for implementation phases)
 - Review results: `notes/review_results_phase_X.md`
 
 ## Goals
