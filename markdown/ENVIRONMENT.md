@@ -20,7 +20,7 @@ copy-pasteable template.
 | `PG_SSLMODE` | `disable` / `require` / `verify-ca` / `verify-full`. **This app deploys `verify-full`** (CA + hostname, fail-closed: a missing/unreadable CA aborts the run rather than downgrading). `require` (encrypted, unauthenticated) is a documented trust-boundary exception, not a default. |
 | `PG_SSL_PATH` | CA cert path for `verify-*` modes (shared host cert `/opt/resources/ssl/pg_ssl.crt`). |
 | `ASSESSOR_KIND` | Which assessor implementation to use. Default **`rules`** (the only one now). A future `llm` value selects the advisory implementation of the same `assess(dossier)` interface. |
-| `MATERIALIZE_OVERLAP_MS` | Watermark overlap lookback (commit-skew safety) for the materialize scan. Small (e.g. a few seconds). |
+| `MATERIALIZE_OVERLAP_MS` | Watermark overlap lookback for the materialize scan. Default **30000** (30s): the overlap is the only protection against a producer row whose INSERT→commit gap outlives it (statement-time `inserted_at`, commit-time visibility) — such a row is skipped silently and permanently once source retention expires. Re-scanned rows are absorbed by `ON CONFLICT`. |
 | `MATERIALIZE_BATCH_ROWS` | Max source rows per insert chunk (bounds memory). |
 | `ASSESS_WINDOW_HOURS` | (optional) Bound for how far back `assess` re-evaluates open incidents / recovery. |
 

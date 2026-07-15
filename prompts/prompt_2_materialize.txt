@@ -4,6 +4,18 @@ Phase 2 - Materialize (L0)
 data behind the changes: producer allowlist + self-log exclusion, note.txt text fallback,
 and Phase 1 conventions (throw-on-failure, dependency-free domain tests, existing ColumnSet).]
 
+[SUPERSEDED CLAUSES — corrected during the Phase 2 Codex review (see
+notes/review_results_phase_2.md + notes/review_results_phase_2_fixes.md; the contract
+docs, not this prompt, are authoritative):
+ - TEXT chain is err_msg || note.message || note.txt || note.skip_reason || ''.
+ - entity fallback is sme -> system_id -> job_id -> '__global__' (entity VARCHAR(64));
+   system_id comes from validated note.system_id first, then sme.
+ - normalize has NO length cap; noise is removed line-wise (stateful curl progress
+   block + JS-stack-frame-shaped lines).
+ - the batch upper bound is a post-lock clock_timestamp() snapshot (not now()), and
+   the watermark advance is GREATEST-guarded.
+ - error_events carries fp_version SMALLINT NOT NULL.]
+
 Goal:
 Flatten the source error stream into incidents.error_events - one row per warn/error event,
 fingerprinted and classified - incrementally and idempotently, reading warn_error_logs only.

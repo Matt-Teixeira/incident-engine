@@ -5,6 +5,312 @@ Durable memory of what's been done and why. Newest entry at the top. Add an entr
 
 ---
 
+# Phase 2 — Materialize (L0)
+
+Date:
+2026-07-14
+
+Status:
+Completed (pending external review + commit)
+
+Prompt:
+`prompts/prompt_2_materialize.txt` (as revised by `notes/phase_2_reevaluation.md`)
+
+Git Commit:
+Pending
+
+Review Artifacts:
+
+- Codex handoff (round 1): `notes/codex_handoff_phase_2.md`
+- Review results (round 1): `notes/review_results_phase_2.md` (2 high, 3 medium,
+  1 low — all fixed, L0 rebuilt)
+- Codex handoff (round 2, fix delta): `notes/codex_handoff_phase_2_fixes.md`
+- Review results (round 2): `notes/review_results_phase_2_fixes.md` (1 high, 1 medium,
+  2 low — all fixed; original findings confirmed closed)
+- Review results (round 3, internal adversarial multi-agent pass over the freeze
+  surface): `notes/review_results_phase_2_round3.md` (17 confirmed / 5 plausible /
+  4 refuted; 10 reported + nits, all fixed — incl. two live-probed poison-event
+  stalls (NUL bytes, JS-vs-PG timestamp parsing) and the pre-freeze fingerprint
+  separator escape; L0 rebuilt at exact parity, 82 buckets unchanged, 47/47 tests)
+
+## Goals
+
+- Flatten `util.app_run_logs.warn_error_logs` into `incidents.error_events` — one row
+  per event, fingerprinted and classified at materialize time — incrementally and
+  idempotently (watermark + `ON CONFLICT`), reading `warn_error_logs` only.
+- Freeze the identity domain: `normalize.js` golden contract, `FP_VERSION=1`
+  fingerprint, classifier copied verbatim from production, entity fallback.
+
+## Built
+
+- `domain/normalize.js` — frozen golden contract: noise-line filter (stateful curl
+  progress block, JS-stack-frame-shaped lines only), then ts/uuid/ip/sme/path/hex/
+  number → placeholders, whitespace-collapse, lowercase. NO length cap (output is
+  only hashed). Golden-tested, incl. preservation goldens for tabular/indented prose.
+- `domain/fingerprint.js` — `sha1(app|func|tag|type|normalize(TEXT))`, `FP_VERSION=1`
+  persisted per row (`error_events.fp_version`); `eventText` implements the
+  live-verified chain `err_msg → note.message → note.txt → note.skip_reason → ''`.
+- `domain/classify.js` — thin wrapper over `utils/classify/connection_regex.js`
+  (verbatim copy from data_acquisition, 26 ordered entries, diff-verified);
+  first-match-wins; `unknown` fallback.
+- `domain/entity.js` — `entity()` (`sme → system_id → job_id → __global__`, 64-cap so
+  a job-UUID fallback is lossless; consumed in Phase 3) + `deriveSystemId()`
+  (`^SME\d{5}$` ⇒ the value IS the system_id; applied to `note.system_id` first,
+  then `note.sme`).
+- `jobs/materialize/` — single transaction: ensure+lock watermark row (`FOR UPDATE`
+  serializes concurrent runs), post-lock `clock_timestamp()` snapshot (monotonic
+  under concurrency; advance guarded by `GREATEST` + `RETURNING` the stored value),
+  bounded scan over the explicit
+  `PRODUCING_APPS` allowlist, pure `flatten.js` (defensive: malformed events → skipped
+  + WARN, never a crash), chunked `pgp.helpers` inserts with
+  `ON CONFLICT (run_id, event_ord) DO NOTHING`, watermark advanced to the snapshot in
+  the same transaction. Env: `MATERIALIZE_OVERLAP_MS` (default 5000),
+  `MATERIALIZE_BATCH_ROWS` (default 5000), validated fail-fast.
+- `utils/db/queries/materialize.js` — all SQL, parameterized.
+- `index.js` — materialize stub replaced with the real job; `assess` still stubbed.
+- Tests: 42 (normalize goldens incl. noise + preservation cases, frozen fingerprints,
+  classify ordering + table-intact, entity, flatten) — all dependency-free, run in
+  bare `node:lts`.
+- `db/schema.sql` — now carries idempotent per-phase UPGRADE sections (Phase 2:
+  `fp_version` add→backfill→NOT NULL; `entity` widen to 64), so an existing Phase 1
+  database is reproducibly upgradeable by re-applying the one tracked file; tested on
+  a scratch Phase 1 database, on re-apply, on fresh install, and on live.
+- `docs/error-taxonomy.md` — flags column synced to the live classifier (5 rows were
+  missing `manual_intervention`; Step 2 doc-drift fix).
+
+## Schema Facts Confirmed (live DB)
+
+- `acquisition-v2` still emits zero `warn_error_logs` events (3-day window) —
+  allowlist decision stands.
+- Event fields: `dt`/`type` 100% present; `type ∈ {WARN, ERROR}`; max `func` 41 chars,
+  max `tag` 10, max `sme` 8; `note` never null (25,210-event day sample).
+- `sme` matches `^SME\d{5}$` and `stats.acquisition_history.system_id` uses the same
+  format ⇒ format-matching sme IS the system_id. Only 69/175 distinct event smes
+  appear in `stats.acquisition_history` — the recovery oracle will not cover every
+  entity (noted for Phase 5).
+- Live classifier flags differ from the taxonomy doc snapshot — doc updated (see Built).
+
+## Important Decisions
+
+### Single-transaction batch (no paging)
+
+Decision: scan → flatten → insert → advance happens in one transaction holding the
+window's rows in memory.
+
+Reason: the crash-consistency story is trivial (any failure rolls back watermark and
+all inserts together), and the worst case observed — full 7-day retention backfill —
+is 14.8k source rows / 184k events / 23.5s. Volume is ~25k events/day thereafter.
+
+Tradeoff: memory grows with the window; flagged to the reviewer with the break-even
+question. Paging (per-page transactions with per-page watermarks) is the known escape
+hatch if volume demands it.
+
+### note.txt in the fingerprint text chain
+
+Decision: implemented the re-evaluated chain `err_msg || note.message || note.txt`.
+
+Reason: without it, ~15% of data_acquisition events (note.txt-only, e.g.
+"NO TUNNEL FOUND") would fingerprint on func/tag alone. Live result: those 10,573
+events group under one fingerprint by their text.
+
+Tradeoff: none now (`FP_VERSION` still 1; nothing was materialized before this phase).
+
+## Architecture Notes
+
+- Write-isolation / least-privilege impact: writes are `incidents.error_events` +
+  `incidents.pipeline_state` only, through the Phase 1 role. No new grants needed.
+- Idempotency / watermark impact: proven live — re-run inserts 0; a deliberate 1-hour
+  watermark rewind re-flattened 1,045 events and inserted 0; PK-distinct = total.
+  Forced failure (bad env) exits 1 with the watermark unadvanced.
+- Classifier / fingerprint stability impact: **`normalize.js` + `fingerprint.js` are
+  frozen as of this phase** (`FP_VERSION=1`, golden tests with literal sha1s). Any
+  future change is a deliberate FP_VERSION-bump phase.
+- Determinism impact: all domain modules pure + dependency-free; no LLM.
+- Data-contract impact: scan reads `warn_error_logs` only, bounded on `inserted_at`
+  both ends; EXPLAIN confirms partition pruning (`Subplans Removed: 6`). Explicit
+  `PRODUCING_APPS` allowlist excludes `incident-engine` (self-log feedback loop) and
+  `acquisition-v2` (parked).
+- Deployment impact: none (same batch one-shot; no schema/role change; cron still not
+  installed — cadence remains an open decision).
+
+## Validation
+
+Commands run:
+
+```bash
+docker run --rm -v "$PWD":/w -w /w node:lts node --test        # 35/35 pass
+docker compose run --rm app node index.js materialize          # backfill, exit 0
+docker compose run --rm app node index.js materialize          # re-run, inserts 0
+# watermark rewound 1h (superuser) → re-run → 1,045 re-flattened, 0 inserted
+docker compose run --rm -e MATERIALIZE_OVERLAP_MS=abc app node index.js materialize  # exit 1
+docker compose run --rm app node index.js run                  # cron path, exit 0
+# EXPLAIN scan as incident_engine_rw → partition pruning confirmed
+```
+
+Results:
+
+- Passed (pre-review): backfill 14,814 source rows → 184,046 events, exactly 1:1 with
+  the source window count, 0 skipped, 23.5s; idempotency (re-run + rewind replay)
+  proven; failure path exits 1 with watermark unadvanced (closes the Phase 1
+  deferral); partition pruning confirmed; 35/35 unit tests.
+- Passed (post-review rebuild): L0 truncated + watermark reset + re-backfilled under
+  the corrected formula in 22s — 185,090 events, exact source parity; 0
+  mixed-category fingerprints; 82 distinct fingerprints; all rows `fp_version=1`;
+  5,285 `note.system_id` events captured; 690 skip_reason events fingerprinted on
+  their stated reason; watermark-regression proof (future watermark not moved
+  backward, catch-up resumes); 41/41 unit tests (6 new).
+- Passed (round-2 fixes): schema upgrade tested on scratch Phase 1 DB / re-apply /
+  fresh / live; noise-filter rewrite proven fingerprint-preserving (0 diffs over all
+  1,808 distinct multiline corpus texts; rebuild checksum byte-identical to the
+  round-1 corpus); watermark summary reports the stored value under GREATEST
+  rejection; 42/42 unit tests (preservation goldens added).
+- Failed: none (one test-authoring miscount fixed: classifier table has 26 entries,
+  not 27).
+- Not run: none outstanding.
+
+Sanity:
+
+- 184,046 events → 141 distinct fingerprints (~1,305 events/fp; GE 5, Philips 17,
+  data_acquisition 119 — proportional to each app's error variety).
+- GE (no err_msg) groups sanely by note.message ("No new file data. Delta: 0" →
+  14,401 events, one fingerprint).
+- `unknown` = 79% of events — expected: most WARN volume is pipeline-status noise;
+  the taxonomy targets connection/extraction errors; severity handling is Phase 4's
+  job. Category is not part of the fingerprint, so a future taxonomy improvement
+  never re-buckets history.
+
+## Review Notes
+
+Source:
+
+- `notes/review_results_phase_2.md` (Codex, from `notes/codex_handoff_phase_2.md`).
+
+Critical issues:
+
+- Codex verdict was "needs fixes before commit": (1) **high** — the 512-char
+  normalization cap merged distinct failures (live evidence: two fingerprints each
+  mixing `connection_timeout` with `partial_transfer_timeout`; the salient curl line
+  sits past a variable-length progress preamble); (2) **high** — `note.system_id`
+  (5,270 live events) was dropped and the entity order preferred per-run job UUIDs
+  over equipment identity, and the 32-char entity cap truncated 36-char UUIDs;
+  (3) **medium** — a blocked concurrent transaction's `now()` (transaction-start
+  clock) could move the watermark backward; (4) **medium** — `FP_VERSION` wasn't
+  persisted per row; (5) **medium** — 688 live events carry text only in
+  `note.skip_reason`, which the chain discarded; (6) **low** — a non-null non-array
+  `warn_error_logs` advanced silently.
+
+Accepted fixes (all six findings):
+
+- **F1**: `normalize.js` now line-filters noise BEFORE scrubbing (curl progress
+  header/rows — both `--:--:--` and completed-time forms — and Node stack frames) and
+  has NO length cap (output is only hashed). New frozen goldens prove: same failure
+  with different progress-row counts/IPs/ports → same fingerprint;
+  connection-timeout vs partial-transfer → distinct. Rebuilt live: **0 fingerprints
+  with mixed categories** (was 2); the noise removal also merged previously
+  over-split buckets — 141 → **82 fingerprints** over 185k events.
+- **F2**: flatten stores validated `note.system_id` (authoritative) with sme-derivation
+  as fallback — all 5,285 such live events now carry `system_id`; entity order is now
+  `sme → system_id → job_id → __global__`; `entity` widened to VARCHAR(64) (holds a
+  36-char job UUID losslessly). Contract docs + prompt_3 updated.
+- **F3**: the batch snapshot is taken via `clock_timestamp()` in a separate statement
+  AFTER the watermark row lock is held (a lock-waiting transaction can no longer carry
+  an older bound), plus `GREATEST(last_inserted_at, $2)` defense in the advance.
+  Proven live: watermark set 1 hour in the future → run exits 0 and the watermark did
+  not regress; normal catch-up advances correctly afterward.
+- **F4**: `error_events.fp_version SMALLINT NOT NULL` added (schema.sql + live ALTER +
+  ColumnSet + flatten); all 185,090 rebuilt rows carry `fp_version = 1`.
+- **F5**: `eventText` chain extended to `err_msg → note.message → note.txt →
+  note.skip_reason → ''`; the 690 skip_reason-only events now fingerprint on the
+  producer's stated reason (2 fingerprints, one per func). Docs synced (taxonomy,
+  principles, incidents-schema).
+- **F6**: a non-null non-array payload now emits a `skipped` diagnostic
+  (`event_ord: null`) surfaced in the run's WARN log — visible but non-blocking; the
+  test that locked in the silent behavior now requires the diagnostic.
+
+Rebuild decision: **`FP_VERSION` stays 1.** Version-1 rows existed only as an
+uncommitted backfill on this branch, nothing had consumed them, and source retention
+still covered the whole window — so L0 was truncated and rebuilt from source under the
+corrected formula (185,090 events, exact source parity re-verified) instead of
+shipping a version-2 migration for data that was never accepted.
+
+Re-review round 2 (`notes/review_results_phase_2_fixes.md`): confirmed findings
+1/3/5/6 closed and 2/4 partially closed pending a tracked upgrade path; raised 1 high,
+1 medium, 2 low — all fixed:
+
+- **RF1 (high)** — the live `fp_version`/`entity` ALTERs weren't reproducible from the
+  repo (schema.sql only had them inside `CREATE TABLE IF NOT EXISTS`). Fixed:
+  `db/schema.sql` now ends with **idempotent per-phase UPGRADE sections** (fp_version
+  add → backfill v1 → SET NOT NULL, no default left behind; entity widen-only to 64
+  via a typmod-guarded DO block). Tested on all four paths: scratch Phase 1 database
+  upgraded (backfill verified), re-apply idempotent, fresh install, live converge.
+  DEPLOYMENT.md documents the "re-apply schema.sql on upgrade; never manual ALTERs"
+  rule. This fully closes original findings 2 and 4.
+- **RF2 (medium)** — the noise filter was over-broad (global `--:--:--`, global
+  numeric-columns rule, prose-eating `^\s+at\s`). Fixed: curl progress rows are now
+  dropped only inside a block opened by curl's own two-line header (stateful), and
+  only lines shaped like real JS stack frames (`:line:col` / `(native)` /
+  `<anonymous>` / `(index N)` tails) are dropped. Preservation goldens added for the
+  review's three probes (tabular summary, indented "at least..." prose, `--:--:--`
+  sentinel as content). **Equivalence proven two ways**: old-vs-new normalization
+  diffed over all 1,808 distinct multiline texts in the live corpus → 0 differences
+  (after adding the `(index N)` frame tail the first diff pass caught); L0 truncated
+  and rebuilt → bounded checksum over (run_id, event_ord, fingerprint) is
+  **byte-identical** to the pre-rewrite corpus (`343d91a2…`, 185,090 rows). FP_VERSION
+  stays 1 with proof, not assertion.
+- **RF3 (low)** — watermark audit metadata: the advance now uses
+  `updated_at = clock_timestamp()` and `RETURNING last_inserted_at`; the run summary
+  reports the STORED watermark (`watermark_after`) plus the requested
+  `snapshot_upper_bound`. Proven live: with a future watermark, the summary reports
+  the preserved future value (matches the DB to the millisecond), not the rejected
+  snapshot.
+- **RF4 (low)** — canonical docs contradicted the corrected contracts: this entry's
+  Built section updated (no cap / noise-line filter, skip_reason chain, entity
+  order + 64, post-lock snapshot, fp_version); `prompt_2_materialize.txt` carries an
+  explicit SUPERSEDED-clauses banner; the Architecture Data-Contract Rule now names
+  `note.skip_reason` and `note.system_id`.
+
+Deferred findings (per round 1's "verified without findings" guidance, reaffirmed in
+round 2):
+
+- Single-transaction memory model: revisit before ~3–5× volume growth; record peak
+  RSS / add a max-window bound when that work happens.
+- `dt` source-clock policy for Phase 3 lifecycle timestamps (define fallback/skew
+  policy using the source row's `inserted_at` — noted in prompt_3 planning).
+- `raw_event` storage share (~101 MB of 230 MB): parked with the retention decision.
+- Overlap default (5s) is adequate for autocommit producers; keep configurable and
+  monitor for lock/commit stalls longer than the overlap (round 2 confirmation).
+
+## Problems Encountered
+
+- classify test initially asserted 27 table entries; the live table has 26 (authoring
+  miscount, not a code defect). Fixed the assertion.
+
+## Follow-Up Tasks
+
+- Codex review of this phase (handoff ready); then commit.
+- Phase 3 (`prompt_3_aggregate_incidents.txt`): aggregate `(fingerprint, entity)` →
+  `incidents.incidents` with blast radius + enrichment join. Note for Phase 3: only
+  ~39% of event smes exist in `stats.acquisition_history` — enrichment must be a LEFT
+  join; recovery-oracle coverage gap matters in Phase 5.
+- Open decisions unchanged: cron cadence, acquisition-v2 onboarding, self-ingestion,
+  retention.
+
+## Commit Readiness
+
+- Requirements implemented: yes (per the re-evaluated prompt).
+- Write-isolation / least-privilege rules hold: yes (no new grants; writes confined).
+- Jobs idempotent (watermark + ON CONFLICT): yes — proven by re-run and rewind replay.
+- Assessment deterministic (no LLM in critical path): n/a (assessor is Phase 4); all
+  domain logic pure.
+- Source queries read warn_error_logs only, partition-pruned: yes (EXPLAIN verified).
+- Schema assumptions confirmed live: yes (see Schema Facts).
+- Review findings addressed or deferred: yes — all 6 Codex findings fixed and
+  re-proven live; 3 monitoring items deferred with reasons (see Review Notes).
+- Validation recorded: yes.
+- Ready to commit: yes, pending developer confirmation.
+
+---
+
 # Phase 1 — App Skeleton + Schema + Role Provisioning
 
 Date:

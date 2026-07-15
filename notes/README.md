@@ -15,6 +15,10 @@ Naming, keyed to the phase:
   **Mandatory after every implementation phase** (docs-only phases may skip it) — see
   `markdown/FLOW.md` Step 7. Model: `/opt/apps/ops-dashboard/docs/code-review-handoff.md`.
 - `review_results_phase_X.md` — the findings that came back
+- `codex_handoff_phase_X_fixes.md` / `review_results_phase_X_fixes.md` — when a review
+  says "needs fixes", the fix round gets its own **delta** handoff: finding→fix table,
+  fix-only scope (don't re-review what round 1 verified clean), per-finding
+  closed/partially/not-closed verdict requested, plus fix-specific weak spots
 - `<topic>_investigation.md` — ad-hoc analysis (e.g. `fingerprint_ratio_investigation.md`)
 
 Required sections of a codex handoff (mirror the model's numbering):

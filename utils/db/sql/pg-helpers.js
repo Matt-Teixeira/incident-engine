@@ -61,6 +61,7 @@ const pg_column_sets = {
                 'job_id',
                 'system_id',
                 'fingerprint',
+                'fp_version',
                 'error_category',
                 'error_type',
                 'phase',
@@ -98,4 +99,7 @@ const pg_column_sets = {
     },
 };
 
-module.exports = { pg_tables, pg_column_sets };
+// pgp is exported so consumers formatting SQL against these ColumnSets
+// (pgp.helpers.insert) use the SAME pg-promise root that built them — a
+// per-root option (capSQL, type parsers) set here then applies everywhere.
+module.exports = { pgp, pg_tables, pg_column_sets };

@@ -28,8 +28,10 @@ review handoff, `notes/codex_handoff_phase_X.md`, modeled on
 ## Idempotency
 
 - Is every job re-runnable with no double-count (persistent watermark + `ON CONFLICT`)?
-- Does the watermark advance in the same transaction as the batch's writes, within a fixed
-  `now()` upper bound (with an overlap lookback for commit skew)?
+- Does the watermark advance in the same transaction as the batch's writes, within a
+  fixed post-lock `clock_timestamp()` upper bound (never transaction-start `now()` —
+  see the Idempotency Rule), with an overlap lookback for commit skew and a
+  `GREATEST`-guarded advance?
 - Was re-running the job proven no-op/additive-only in the smoke test?
 
 ## Determinism (no LLM)

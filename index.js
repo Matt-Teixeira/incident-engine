@@ -1,4 +1,4 @@
-("use strict");
+"use strict";
 require("dotenv").config();
 
 // The self-log identity is a code constant: a mismatched APP_NAME env would
@@ -28,12 +28,9 @@ const {
   tag: { cal, det, cat },
 } = require("./utils/logger/enums");
 
-// Phase 2: watermark → scan warn_error_logs (partition-pruned) → flatten/
-// fingerprint/classify → incidents.error_events. Stub until then so the
-// run-log lifecycle executes end-to-end.
-const materialize = async (run_log) => {
-  await addLogEvent(I, run_log, "materialize", det, { txt: "stub - built in Phase 2" }, null);
-};
+// L0: watermark → bounded warn_error_logs scan → flatten/fingerprint/classify
+// → incidents.error_events (see jobs/materialize).
+const materialize = require("./jobs/materialize");
 
 // Phases 3-5: aggregate → incidents.incidents, deterministic assess, state
 // machine + auto-close. Stub until then.

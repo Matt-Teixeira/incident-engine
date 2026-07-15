@@ -42,6 +42,7 @@ Schema assumptions to confirm live (Step 2):
 
 Review questions:
 - Is (fingerprint, entity) the correct grouping grain, and does UNIQUE hold on re-run?
-- Is the entity fallback (sme -> job_id -> system_id -> __global__) producing sane bucket
+- Is the entity fallback (sme -> system_id -> job_id -> __global__; revised by the Phase 2
+  review - job ids are per-run UUIDs) producing sane bucket
   sizes (validate __global__ volume)?
 - Is enrichment strictly best-effort (never overwrites a confident classify with a null)?

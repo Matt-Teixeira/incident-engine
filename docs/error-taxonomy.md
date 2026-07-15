@@ -12,11 +12,13 @@ the pipeline already computes onto `stats.acquisition_history.error_category` an
 
 ## How the classifier is used
 
-- Input text = `err_msg || note.message || note.txt || ''` from a `warn_error_logs` event.
-  Live-verified 2026-07-14: `err_msg` is sparse (0% on `hhm_rpp_ge`, 55% on
-  `data_acquisition`); `note.message` is the primary fallback (100% on GE); `note.txt` is
-  a `data_acquisition`-only second fallback (~15% of its events, e.g.
-  `{txt: "NO TUNNEL FOUND"}`) — the three are nearly complementary per app.
+- Input text = `err_msg || note.message || note.txt || note.skip_reason || ''` from a
+  `warn_error_logs` event. Live-verified 2026-07-14: `err_msg` is sparse (0% on
+  `hhm_rpp_ge`, 55% on `data_acquisition`); `note.message` is the primary fallback
+  (100% on GE); `note.txt` is a `data_acquisition`-only second fallback (~15% of its
+  events, e.g. `{txt: "NO TUNNEL FOUND"}`); `note.skip_reason` (e.g.
+  `missing host_ip`, 688 events) is the producer's stated reason when all else is
+  empty — the fields are nearly complementary per app.
 - `connection_regexes` is an **ordered** array; **first match wins**. Ordering places
   root-cause signals (SSH auth, host-key) above downstream symptoms (generic "connection
   unexpectedly closed"). Patterns are **not** `/g` (stateful `.test()` on shared objects).
@@ -41,17 +43,17 @@ Each entry carries: `error_type` (connection | key | credentials | file), `error
 | `host_unreachable` | connection | ssh/scp/rsync "connect to host <ip> port <p>: No route to host" | |
 | `connection_refused` | connection | "Connection refused" | |
 | `host_key_changed` | key | "remote host identification has changed" | manual_intervention |
-| `host_key_new` | key | "Warning: Permanently added '<ip>' ... known hosts" | |
-| `key_exchange` | key | "Unable to negotiate with <ip> ..." | |
-| `credentials` | credentials | "Login failed" / "Login incorrect"; "Permission denied (publickey" | |
+| `host_key_new` | key | "Warning: Permanently added '<ip>' ... known hosts" | manual_intervention |
+| `key_exchange` | key | "Unable to negotiate with <ip> ..." | manual_intervention |
+| `credentials` | credentials | "Login failed" / "Login incorrect"; "Permission denied (publickey" | manual_intervention |
 | `rsync_io_timeout` | connection | "rsync error: timeout in data send/receive" | |
 | `rsync_protocol_error` | connection | "error in rsync protocol data stream" | |
-| `permission_denied_partial` | file | "mget: Access failed: Permission denied" | successful_acquisition |
-| `file_missing_partial` | file | "mget: Access failed: No such file"; "550"; "no files found" | |
-| `mirror_file_skipped` | file | "mirror: ... Access failed: 550" | |
+| `permission_denied_partial` | file | "mget: Access failed: Permission denied" | manual_intervention, successful_acquisition |
+| `file_missing_partial` | file | "mget: Access failed: No such file"; "550"; "no files found" | successful_acquisition |
+| `mirror_file_skipped` | file | "mirror: ... Access failed: 550" | successful_acquisition |
 | `rsync_source_missing` | file | "rsync: [sender] link_stat ... failed: No such file" | |
 | `rsync_partial` | file | "rsync error: some files/attrs were not transferred" | successful_acquisition |
-| `file_missing` | file | "(scp|tar): No match" | |
+| `file_missing` | file | "(scp|tar): No match" | manual_intervention |
 | `unknown` | (none) | no pattern matched (caller-set fallback) | |
 | `hanging_exec` | (none) | exec timeout (caller-set) | |
 

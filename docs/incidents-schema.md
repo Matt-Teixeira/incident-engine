@@ -21,10 +21,11 @@ One row per `warn_error_logs` event, fingerprinted + classified at materialize t
 | `tag` | VARCHAR(32) | `DETAILS` / `CATCH` / `CALL` / `QA FAILURE` / '' |
 | `err_msg` | TEXT | sparse (0% on hhm_rpp_ge) |
 | `note_message` | TEXT | `note.message` (err_msg fallback) |
-| `sme` | VARCHAR(16) | `note.sme` — cross-app equipment key (~64% present) |
+| `sme` | VARCHAR(16) | `note.sme` — cross-app equipment key (~46–84% by app) |
 | `job_id` | TEXT | `note.job_id` |
-| `system_id` | VARCHAR(8) | resolved when derivable (join key to stats/alert) |
-| `fingerprint` | CHAR(40) | `sha1(app\|func\|tag\|type\|normalize(err_msg\|\|note.message\|\|note.txt))` |
+| `system_id` | VARCHAR(8) | `note.system_id` when present (validated), else derived from `sme` (`^SME\d{5}$` ⇒ sme IS the system_id) |
+| `fingerprint` | CHAR(40) | `sha1(app\|func\|tag\|type\|normalize(err_msg\|\|note.message\|\|note.txt\|\|note.skip_reason))` |
+| `fp_version` | SMALLINT NOT NULL | which fingerprint formula produced this row (`FP_VERSION`) — provenance for version-aware rebuilds |
 | `error_category` | VARCHAR(64) | classify output (`unknown` when unmatched) |
 | `error_type` | VARCHAR(16) | connection / key / credentials / file |
 | `phase` | VARCHAR(32) | best-effort from enrichment; default '' |
@@ -42,7 +43,7 @@ One row per `warn_error_logs` event, fingerprinted + classified at materialize t
 | --- | --- | --- |
 | `id` | BIGSERIAL PK | |
 | `fingerprint` | CHAR(40) | with `entity`, the identity |
-| `entity` | VARCHAR(32) | `sme` → `job_id` → `system_id` → `__global__` |
+| `entity` | VARCHAR(64) | `sme` → `system_id` → `job_id` → `__global__` (system_id above job_id: job ids are per-run UUIDs; 64 holds a 36-char UUID losslessly) |
 | `occurrence_count` | BIGINT | += batch count on upsert |
 | `first_seen` / `last_seen` | TIMESTAMPTZ | LEAST / GREATEST on upsert |
 | `apps` | TEXT[] | blast radius across apps (union) |

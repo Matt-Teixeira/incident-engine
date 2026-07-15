@@ -62,10 +62,13 @@ The source is `util.app_run_logs`; confirmed facts (re-verify if the table chang
 - Only a few apps emit warn/error events (`data_acquisition`, `hhm_rpp_ge`,
   `hhm_rpp_philips`). Event fields are **top-level** (`type`, `func`, `tag`, `err_msg`,
   `dt`) with a nested `note`. `err_msg` is sparse (0% on `hhm_rpp_ge`); fall back to
-  `note.message`, then `note.txt` (`data_acquisition`-only). `note.sme` (~46–84% by app)
-  is the cross-app equipment key. **This app also writes this table** (self-log), so
-  every source scan must exclude `app_name = 'incident-engine'` — ingesting our own
-  errors is a feedback loop, not a feature (unless a future phase decides otherwise).
+  `note.message`, then `note.txt`, then `note.skip_reason` (both
+  `data_acquisition`-only). `note.sme` (~46–84% by app) is the cross-app equipment
+  key; `note.system_id` (validated `^SME\d{5}$`) is authoritative for `system_id` when
+  present, with sme-derivation as the fallback. **This app also writes this table**
+  (self-log), so every source scan must exclude `app_name = 'incident-engine'` —
+  ingesting our own errors is a feedback loop, not a feature (unless a future phase
+  decides otherwise).
 - **Source retention is short (~7 days)**, so this app **persists its own durable
   rollups** rather than assuming long history upstream.
 
@@ -78,8 +81,11 @@ not partitioned. This app only reads it. See `docs/incidents-schema.md` for the 
 
 Every job is re-runnable with no double-count.
 
-- A persistent **watermark** (`incidents.pipeline_state`) advances only within the batch's
-  fixed `now()` upper bound; a small overlap lookback absorbs commit skew.
+- A persistent **watermark** (`incidents.pipeline_state`) advances only within the
+  batch's fixed upper bound — a `clock_timestamp()` snapshot taken **after** the
+  watermark row lock is held (NOT transaction-start `now()`, which lets a
+  lock-waiting run carry an older bound and regress the watermark); a small overlap
+  lookback absorbs producer commit skew, and the advance is `GREATEST`-guarded.
 - All writes are `ON CONFLICT` (append-only `error_events` keyed `(run_id, event_ord)`;
   aggregated `incidents` keyed `(fingerprint, entity)`).
 - The watermark advances in the **same transaction** as the batch's writes, so a crash
@@ -106,9 +112,11 @@ Never ship the app pointed at a superuser. Role setup lives in `db/setup-owner-r
 Incidents are only as good as their grouping key.
 
 - The fingerprint is `sha1(src_app_name | func | tag | type | normalize(err_msg ||
-  note.message || note.txt))`, carrying a `FP_VERSION` constant so a formula change is
-  detectable. (`note.txt` added pre-implementation, 2026-07-14: it is
-  `data_acquisition`'s only text on ~15% of its events.)
+  note.message || note.txt || note.skip_reason))`, carrying a `FP_VERSION` constant
+  **persisted per row** (`error_events.fp_version`) so a formula change is detectable
+  and old rows are rebuildable per version. (`note.txt` added pre-implementation and
+  `note.skip_reason` post-review, 2026-07-14 — each is the only text on a live slice
+  of `data_acquisition` events.)
 - `normalize.js` (scrubbing IPs / paths / ids / timestamps into placeholders) is a
   **frozen, golden-tested contract** — changing it changes every fingerprint, so it moves
   only in a deliberate, logged phase with `FP_VERSION` bumped.

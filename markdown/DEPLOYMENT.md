@@ -15,6 +15,10 @@ Before the app can run, the owned schema + least-privilege role must exist. Appl
 superuser (e.g. `docker exec -i pg_db psql -U postgres -d staging`):
 
 1. `db/schema.sql` — creates the `incidents` schema, tables, indexes, and `pipeline_state`.
+   The same file carries **idempotent per-phase UPGRADE sections** at the end: re-apply
+   it (as superuser) whenever a phase changes the schema — a fresh database gets the
+   final shape from the CREATEs, an existing one converges via the upgrade sections.
+   Never apply schema changes manually outside this file.
 2. `db/setup-owner-role.sql` — creates `incident_engine_rw` (owns `incidents`; fail-closed
    `SELECT` on `util.app_run_logs` + `stats.acquisition_history`; `INSERT` via the
    `util.incident_engine_self_log` check-option view for self-log — no base-table INSERT).
