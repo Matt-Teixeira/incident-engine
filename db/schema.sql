@@ -28,6 +28,9 @@ CREATE TABLE IF NOT EXISTS incidents.error_events(
     sme VARCHAR(16),
     job_id TEXT,
     system_id VARCHAR(8),
+    -- the incident dimension (sme → system_id → '__global__'), stamped at
+    -- materialize time by domain/entity(); the Phase 3 aggregate GROUPs on it.
+    entity VARCHAR(64) NOT NULL,
     fingerprint CHAR(40),
     fp_version SMALLINT NOT NULL,
     error_category VARCHAR(64),
@@ -35,7 +38,20 @@ CREATE TABLE IF NOT EXISTS incidents.error_events(
     phase VARCHAR(32),
     dt TIMESTAMPTZ,
     raw_event JSONB,
-    inserted_at TIMESTAMPTZ DEFAULT NOW(),
+    -- clock_timestamp() (insert-statement time), NOT NOW()/transaction_timestamp
+    -- (transaction-START time). This column is the CURSOR the Phase 3 aggregate
+    -- watermarks on, and the aggregate window is strict (watermark, snapshot].
+    -- A materialize tx that starts before an aggregate but commits after it must
+    -- NOT stamp its rows with a transaction-start time that predates the
+    -- aggregate's watermark — those rows would sit below the watermark and be
+    -- skipped forever (Phase 3 review, high finding). clock_timestamp() is
+    -- evaluated per row at INSERT time, which is always AFTER materialize
+    -- acquires the shared watermark lock, so the cursor orders correctly with
+    -- the lock. See jobs/aggregate/index.js. NOTE (Phase 3 re-review): this
+    -- assumes a NONDECREASING clock across the lock handoff (wall clock, not a
+    -- monotonic primitive); a backward clock step could silently undercount. A
+    -- monotonic BIGSERIAL/batch cursor is the unconditional upgrade path.
+    inserted_at TIMESTAMPTZ DEFAULT clock_timestamp(),
     CONSTRAINT pk_error_events PRIMARY KEY (run_id, event_ord)
 );
 
@@ -123,6 +139,9 @@ ALTER TABLE incidents.error_events ALTER COLUMN fp_version DROP DEFAULT;
 
 -- Phase 2: entity must hold a 36-char job-UUID fallback losslessly. Widen only
 -- (never narrow); no-op once at 64+.
+-- (Phase 3 later removed job_id from the fallback, so incidents.entity now only
+--  ever holds an sme/system_id/'__global__' value — all ≤16 chars. The 64 width
+--  is kept as a harmless backstop; never narrow a live column.)
 DO $$
 DECLARE
   len int;
@@ -134,3 +153,37 @@ BEGIN
     ALTER TABLE incidents.incidents ALTER COLUMN entity TYPE VARCHAR(64);
   END IF;
 END $$;
+
+-- Phase 3: the incident dimension is now STORED on each L0 row (single source
+-- of truth = domain/entity(); the aggregate GROUPs on it instead of re-deriving
+-- entity in SQL). Add nullable → backfill existing rows → SET NOT NULL, so an
+-- existing Phase 2 database converges. On a fresh install the CREATE above
+-- already made the column NOT NULL, so ADD IF NOT EXISTS is a no-op, the
+-- backfill UPDATE matches nothing, and SET NOT NULL is idempotent.
+--
+-- BACKFILL PARITY: this expression reproduces domain/entity() for the values
+-- already STORED on error_events (sme is stored trimmed via nonEmptyString and
+-- capped to 16; system_id is a validated ^SME\d{5}$ token or NULL). It is the
+-- ONE-TIME migration path only — going-forward rows are stamped by entity() in
+-- jobs/materialize/flatten.js. job_id is intentionally absent (Phase 3 dropped
+-- it from the chain). Validation asserts column == entity() over all rows.
+-- The explicit whitespace set matches JS String.trim() (used by nonEmptyString
+-- inside entity()): btrim's DEFAULT set is spaces only, so a non-space
+-- whitespace char left trailing by the 16-char sme cap would survive here but be
+-- stripped by entity(), splitting one incident in two (re-review, low finding).
+ALTER TABLE incidents.error_events ADD COLUMN IF NOT EXISTS entity VARCHAR(64);
+UPDATE incidents.error_events
+   SET entity = left(
+         COALESCE(NULLIF(btrim(sme, E' \t\n\r\f\v'), ''),
+                  NULLIF(btrim(system_id, E' \t\n\r\f\v'), ''),
+                  '__global__'),
+         64)
+ WHERE entity IS NULL;
+ALTER TABLE incidents.error_events ALTER COLUMN entity SET NOT NULL;
+
+-- Phase 3 (review, high finding): the aggregate cursor must be stamped at INSERT
+-- time (post-lock), never at transaction-start. Move the default off NOW() so a
+-- late-committing materialize can no longer stamp rows below an aggregate
+-- watermark advanced while it was mid-transaction. Existing rows keep their
+-- historical inserted_at (already aggregated); only new inserts are affected.
+ALTER TABLE incidents.error_events ALTER COLUMN inserted_at SET DEFAULT clock_timestamp();

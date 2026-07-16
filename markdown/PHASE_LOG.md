@@ -5,6 +5,380 @@ Durable memory of what's been done and why. Newest entry at the top. Add an entr
 
 ---
 
+# Phase 3 — Aggregate Incidents (L1/L2)
+
+Date:
+2026-07-15
+
+Status:
+Completed
+
+Prompt:
+`prompts/prompt_3_aggregate_incidents.txt`
+
+Git Commit:
+Pending
+
+Review Artifacts:
+
+- Codex handoff (round 1): `notes/codex_handoff_phase_3.md`
+- Review results (round 1): `notes/review_results_phase_3.md` (1 high, 1 medium,
+  2 low — all fixed and re-validated live)
+- Codex handoff (fix round, delta): `notes/codex_handoff_phase_3_fixes.md`
+- Review results (round 2, re-review): `notes/review_results_phase_3.md` (§round 2 —
+  1 medium clock-assumption + stale comments, 1 low whitespace-trim; both addressed;
+  F2/F3 confirmed closed)
+- Review results (round 3, independent self-review): `notes/review_results_phase_3.md`
+  (§round 3 — no high/medium; 4 low; #1 backfill-trim + #3 corroborated-type-doc fixed,
+  #2 noted, #4 left; a backtick-in-template-literal bug introduced by the #2 note was
+  caught by RUNNING the job and fixed)
+
+## Goals
+
+- Roll new `incidents.error_events` rows up into `incidents.incidents`, one row per
+  `(fingerprint, entity)`, via a watermarked, idempotent
+  `INSERT … SELECT … GROUP BY … ON CONFLICT (fingerprint, entity) DO UPDATE` upsert:
+  additive `occurrence_count`, `first_seen`/`last_seen` (LEAST/GREATEST), `apps[]`/
+  `systems[]` unions, a representative event, category/error_type/func, and best-effort
+  enrichment.
+- No assessor / severity / state / auto-close (Phases 4–5); `action_*` never written.
+
+## Built
+
+- `domain/entity.js` — **dropped `job_id`** from the entity fallback (`sme → system_id →
+  __global__`). `entity()` is the single source of truth; `test/entity.test.js` updated.
+- `jobs/materialize/flatten.js` + `utils/db/sql/pg-helpers.js` — each L0 row now carries a
+  stored `entity` (stamped by `entity()`), computed from the same `system_id` value that is
+  persisted (no drift). The aggregate GROUPs on this column, never re-deriving entity in SQL.
+- `db/schema.sql` — `error_events.entity VARCHAR(64) NOT NULL` in CREATE + a Phase 3 UPGRADE
+  section (add nullable → one-time SQL backfill mirroring `entity()` → SET NOT NULL). Also
+  moved `error_events.inserted_at` to `DEFAULT clock_timestamp()` (was `NOW()`) — the
+  aggregate cursor must be stamped at insert-time/post-lock, not transaction-start (review
+  F1). Fresh and upgraded installs converge; re-apply is idempotent.
+- `utils/db/queries/incidents.js` — the aggregate upsert (set-based, static, parameterized
+  `$1/$2` window). Strict window `(watermark, snapshot]`, **no overlap**; additive
+  `occurrence_count`; array-union apps/systems; `DISTINCT ON` representative on the total
+  order `ts, run_id, event_ord`; representative-derived fields refreshed on the
+  `(last_seen, sample_run_id)` total order so rebuild == incremental (review F3); `msg`
+  reconstructs `eventText` with `btrim` + `jsonb_typeof='string'` guards (review F4);
+  `RETURNING (xmax = 0)` to report inserted vs. updated.
+- `utils/db/queries/enrichment.js` — `stats.acquisition_history` corroboration, **system_id
+  only**, category-when-`unknown` only (advisory; never overwrites a confident category or
+  writes NULL).
+- `jobs/aggregate/index.js` — the transaction: lock the materialize watermark row
+  `FOR UPDATE`, ensure+lock own watermark, post-lock `clock_timestamp()` snapshot, upsert,
+  `GREATEST`-guarded advance — all one tx. Exactly-once rests on BOTH this lock AND the
+  post-lock `inserted_at` cursor stamp (review F1); overlap-free additive count. Reuses the
+  generic watermark SQL from Phase 2.
+- `index.js` — `assess` now calls `aggregate` (was a stub); the deterministic assessor lands
+  here in Phase 4.
+- Docs: `docs/incidents-schema.md` (entity column + dropped job_id + enrichment reality +
+  sample_message wording + `inserted_at` cursor note), `markdown/PROMPTS.md` status.
+- Tests: 49 unit (dependency-free, bare `node:lts`) + 2 live DB integration tests under
+  `integration/` (`aggregate_race.js`, `rep_determinism.js` — run in the app container, not
+  discovered by `node --test`).
+
+## Schema Facts Confirmed (live DB)
+
+- `incidents.incidents` columns/types match the contract; **no** `modality`/`manufacturer`
+  columns exist (the prompt's enrichment list overshot the schema).
+- `error_events.dt` is **never null** across the 186k rows (`dt_null = 0`); all `fp_version=1`.
+- **Entity grain:** with `job_id` in the fallback, the L0 rows produced **38,578**
+  `(fingerprint, entity)` pairs — ~38,084 singleton incidents keyed on per-run job UUIDs,
+  from just **4** `(app, func, fingerprint)` combos (all `unknown`). Dropping `job_id` →
+  **498** pairs. This answered the prompt's "sane bucket sizes?" review question with data.
+- **Enrichment reality:** the source `run_id` does **not** correlate with
+  `stats.acquisition_history.run_id` — **0 of 124,361** rows matched on `(system_id, run_id)`.
+  On `system_id` alone, **111 of 217** distinct systems match. So the join is system_id-only
+  and LEFT.
+- Source retention still covered the full L0 window at implementation time (src_min
+  2026-07-07 14:58), but the entity migration was done **non-destructively** (add column +
+  in-place backfill), not by rebuild.
+- Backfill parity: stored `entity` == `entity()` expression for **all** 186k rows
+  (0 mismatches); 0 nulls after `SET NOT NULL`.
+
+## Important Decisions
+
+### Drop `job_id` from the entity fallback (contract change)
+
+Decision: `entity()` is now `sme → system_id → '__global__'`; `job_id` is stored on L0 for
+provenance but is never an entity key.
+
+Reason: `job_id` is a per-run UUID. As an entity it mints one incident identity **per run**,
+never aggregates across runs, and turns the incidents table back into the firehose the app
+exists to collapse (live: 4 fingerprints → ~38k singleton incidents). Phase 2 had already
+demoted `job_id` below `system_id` for this reason; Phase 3, its first consumer, removes it.
+
+Tradeoff: an event with no `sme`/`system_id` now shares the `__global__` bucket for its
+fingerprint (one incident per distinct problem when equipment is unknown) instead of a
+per-run bucket. Developer-approved before implementation.
+
+### Exactly-once via serialize-vs-materialize + post-lock cursor + zero overlap
+
+Decision: the aggregate takes **no** overlap lookback; the window is the strict
+`(watermark, snapshot]`. Exactly-once rests on TWO guarantees together (the second was
+added in the round-1 high fix — the lock alone is insufficient):
+(a) the aggregate locks the materialize watermark row `FOR UPDATE` before snapshotting, so
+no materialize tx *commits* between the read and the advance; and (b) `error_events.inserted_at`
+— the cursor — is `DEFAULT clock_timestamp()` (insert-time, post-lock), so a materialize tx
+that *started* before the aggregate but commits after it still stamps its rows above the
+aggregate's watermark and is caught next window.
+
+Reason: `occurrence_count` is additive, and an additive counter double-counts any row that
+falls in two windows — exactly what an overlap lookback causes (trace: a row at
+`inserted_at=98` re-scanned by a later `(95,200]` window is added twice). A clock-based
+overlap cannot distinguish "already counted" from "newly visible after commit-skew", so the
+only exactly-once options are per-row dedup state or removing the skew. The lock+post-lock-cursor
+removes the skew, letting the additive count be exactly-once by construction. Materialize's
+job code is unchanged (the aggregate simply also locks the row materialize already holds; the
+cursor fix is a column default). Proven by `integration/aggregate_race.js`.
+
+Tradeoff: `assess` and `materialize` cannot run concurrently (acceptable — both are
+sub-second/second-scale internal jobs; the normal `run` path is sequential anyway). A
+deliberate watermark **rewind** after a committed batch is **not** idempotent for an additive
+counter — treated as out-of-scope operator action (recovery = truncate + reset + re-aggregate).
+CLOCK CAVEAT (re-review R1): "exactly-once" holds under a **nondecreasing database clock** —
+the timestamp cursor is a wall clock; a backward step could silently undercount. This matches
+the assumption the rest of the pipeline's watermarks already make; the unconditional fix is a
+monotonic post-lock cursor (upgrade path, not built).
+
+### Enrichment scoped to system_id-only, category-when-unknown
+
+Decision: LEFT JOIN `stats.acquisition_history` on `system_id` only; use it solely to
+corroborate `category` when classify returned `unknown`. No `phase`/`modality`/`manufacturer`.
+
+Reason: `run_id` never joins (0/124,361), so per-run correlation is impossible; `incidents`
+has no modality/manufacturer columns; a per-run `phase` from an uncorrelated run is
+misleading. Developer-approved. Time-correlated oracle use (auto-close) is Phase 5.
+
+Tradeoff: corroboration is coarse (latest non-`unknown` category for the system, time-
+uncorrelated). Advisory only; classify stays primary; 39/498 incidents corroborated live.
+
+### `first_seen`/`last_seen` from `COALESCE(dt, inserted_at)`
+
+Decision: lifecycle timestamps derive from the event's own `dt`, falling back to L0
+`inserted_at` only for null-`dt` rows (currently none).
+
+Reason: `dt` is the semantically correct "when the problem occurred"; `inserted_at` is
+materialization time (a poor proxy after a backfill), used only so a null-`dt` row still
+contributes a real instant instead of being dropped. Source-clock skew is the producer's
+truth, not corrected here (noted for Phase 5 auto-close timing).
+
+## Architecture Notes
+
+- Write-isolation / least-privilege: writes are `incidents.incidents` +
+  `incidents.pipeline_state` only; `stats.acquisition_history` SELECT-only in the enrichment
+  CTE. No new grant — the role owns `incidents` (covers the new `error_events.entity` column
+  and all `incidents` writes); proven by the live `assess`/`run` smokes as `incident_engine_rw`.
+- Idempotency / watermark: second `pipeline_state` row `incidents.error_events`, mirroring
+  materialize's ensure→lock→post-lock-snapshot→GREATEST-advance, same tx. **Zero overlap**;
+  exactly-once via the materialize-row serialization lock (see decision). Proven live: first
+  aggregate `sum(occurrence_count)` == L0 total (delta 0); re-run unchanged; incremental
+  `run` counted ~17k new events exactly once (delta stays 0).
+- Classifier / fingerprint stability: untouched. `FP_VERSION` stays 1; `normalize.js`/
+  `fingerprint.js` not modified. `category` on an incident may differ from its events only
+  when enrichment corroborated an `unknown` (advisory), never via a fingerprint change.
+- Determinism: aggregate is pure SQL over stored facts; enrichment advisory; no LLM. The
+  assessor (Phase 4) is still absent — `state`/`severity`/`assessment` unwritten.
+- Data-contract: reads `error_events` (this app's own L0) + `stats.acquisition_history`
+  (SELECT); never `verbose_log`. EXPLAIN: steady-state narrow window uses BRIN
+  (`idx_error_events_inserted_brin`, cost ~1.8k); full backfill window seq-scans (correct —
+  whole table); enrichment uses `idx_acq_hist_err_cat_inserted`; conflict arbiter is
+  `uq_incidents_fingerprint_entity`.
+- Deployment: no new deploy surface (same batch one-shot). Superuser step this phase:
+  re-apply `db/schema.sql` (adds + backfills `error_events.entity`) **before** running the
+  new `assess`. Cron cadence still open.
+
+## Validation
+
+Commands run:
+
+```bash
+docker run --rm -v "$PWD":/w -w /w node:lts node --test                       # 48/48 pass
+docker exec -i pg_db psql -U postgres -d staging -f - < db/schema.sql          # entity add+backfill+NOT NULL (UPDATE 186131)
+docker compose run --rm app node index.js assess                               # first aggregate, exit 0
+docker compose run --rm app node index.js assess                               # re-run: no double-count
+docker compose run --rm app node index.js run                                  # materialize → assess incremental
+# EXPLAIN of the upsert (full + narrow window) as postgres
+```
+
+Results:
+
+- Passed: 48/48 unit tests. Backfill parity 0 mismatches / 0 nulls. First aggregate = 498
+  incidents, `sum(occurrence_count)` = 186,131 = L0 total (**exactly-once delta 0**). Re-run
+  (empty window) = unchanged (498 / 186,131). Incremental `run` materialized ~17,465 new
+  events and aggregated them → 503 incidents, `sum` = 203,596 = new L0 total (**delta still
+  0**). `state`/`severity` NULL on all rows (Phase 4 boundary). Enrichment corroborated
+  39/498 `unknown` incidents. EXPLAIN: BRIN for steady-state, correct conflict arbiter.
+- Failed: none.
+- Not run initially, ADDED in the fix round: the concurrent-race integration test
+  (`integration/aggregate_race.js`, deterministic two-connection interleaving — the
+  round-1 high finding's proof) and the representative rebuild-vs-incremental determinism
+  test (`integration/rep_determinism.js`). Still not run: a watermark-rewind
+  demonstration (would corrupt the additive count — documented as out-of-scope operator
+  action); crash-mid-batch is covered by transactional rollback (reasoned, not fault-injected).
+
+Manual / smoke tests:
+
+- Formerly-fractured job_id fingerprints are now single `__global__` incidents with high
+  counts (runJob 23,163; getTunnelsByIP 10,698; gzip_n_save 13,533 / 9,369; phil_cv_eventlog
+  2,776) — the aggregation win, visible directly.
+- Representative messages are human-readable ("JOB HALTED", "NO TUNNEL FOUND", "File Not
+  Present"), not the normalized hash input.
+
+## Review Notes
+
+Source:
+
+- `notes/review_results_phase_3.md` (Codex, from `notes/codex_handoff_phase_3.md`).
+
+Critical issues:
+
+- Codex verdict was "needs fixes before commit": (1) **high** — the shared watermark
+  lock did NOT eliminate commit skew. `error_events.inserted_at DEFAULT NOW()` is
+  transaction-START time; a materialize tx can fix its `NOW()` before acquiring the
+  lock, be descheduled, and commit AFTER an aggregate advanced its watermark, leaving
+  its rows below the strict `inserted_at > watermark` window — skipped forever. The
+  lock serialized commits but not the cursor value. (2) **medium** — flatten derived
+  `entity` from the UNcapped sme while storing sme capped to 16, so a >16-char sme got
+  a 64-char entity on new rows but a 16-char entity from the backfill → split incident.
+  (3) **low** — the representative tie-break was deterministic only within a batch (the
+  `>=` refresh resolved equal-ts events by batch arrival order → rebuild ≠ incremental).
+  (4) **low** — the SQL `msg` reconstruction didn't match `eventText`: it only rejected
+  literal `''`, so a whitespace-only `note.txt` suppressed a valid `skip_reason` and
+  padding survived.
+
+Accepted fixes (all four findings; detail in `notes/review_results_phase_3.md`):
+
+- **F1**: `error_events.inserted_at` now `DEFAULT clock_timestamp()` (insert-time,
+  post-lock), so the cursor orders with the lock — a late-committing materialize stamps
+  its rows AFTER any watermark the aggregate set while it waited, and they're caught
+  next window. Exactly-once now explicitly requires BOTH the lock AND the post-lock
+  stamp (comments in `incidents.js`/`aggregate/index.js` corrected; the old "lock alone
+  suffices" claim was the bug). New `integration/aggregate_race.js` reproduces the
+  interleaving and proves the `clock_timestamp()` row is caught while a
+  `transaction_timestamp()` (old-default) row in the same commit is skipped → PASS.
+- **F2**: `flatten.js` derives stored `sme` and `entity()` from one `cap(sme,16)` value;
+  long-sme parity unit test added.
+- **F3**: `rep` sort key aligned to `ts DESC, run_id DESC, event_ord DESC` and the ON
+  CONFLICT refresh guarded by the `(last_seen, sample_run_id)` total order → order-
+  independent. New `integration/rep_determinism.js`: rebuild vs. 2-window
+  incremental → 0 mismatches.
+- **F4**: `msg` `btrim`s each candidate and guards `raw_event` extraction with
+  `jsonb_typeof(...) = 'string'`, matching `nonEmptyString`.
+
+Confirmed clean by the reviewer (left as-is): watermark-rewind policy (reasonable —
+`GREATEST` guards ordinary retries; rewind is explicit operator recovery), deadlock-free
+lock order, write-isolation + grants, parameterized/injection-safe static SQL.
+
+Re-review (round 2, `notes/review_results_phase_3.md` §round 2): confirmed F2/F3 closed;
+raised 1 medium + 1 low against the F1/F4 fixes — both addressed:
+
+- **R1 (medium)** — exactly-once still assumed `clock_timestamp()` is nondecreasing across
+  the lock handoff (a wall clock, not a monotonic primitive); a backward clock step in the
+  sub-second window between the aggregate's advance and a pre-lock materialize's insert
+  could silently UNDERcount (never double-count/corrupt). Also stale comments claimed "no
+  materialize tx can be in flight" (pre-lock tx's can be). Resolution (Codex-sanctioned):
+  **explicitly documented the guarantee as "exactly-once under a nondecreasing clock"** and
+  corrected the comments (the lock excludes *committing* tx's; guarantee (b), the post-lock
+  stamp, orders a pre-lock tx's rows) in `jobs/aggregate/index.js`,
+  `utils/db/queries/incidents.js`, `db/schema.sql`. The whole pipeline already assumes a
+  nondecreasing clock, so a monotonic cursor for the aggregate alone would be inconsistent;
+  the unconditional fix (post-lock `BIGSERIAL`/batch-sequence cursor) is recorded as the
+  upgrade path, not built (proportionate to the residual; a pipeline-wide decision).
+- **R2 (low)** — `btrim` default trims spaces only; JS `String.trim()` also strips tab/
+  newline/etc. Fixed: `msg` now `btrim(x, E' \t\n\r\f\v')` on every candidate. Verified
+  live (a `"\t\n"` `note.txt` now correctly falls through to `skip_reason`). Exotic Unicode
+  whitespace remains uncovered (never in these ASCII messages); persisting `eventText` on L0
+  is the exact-parity upgrade, noted in the query comment.
+
+Round 3 (independent self-review, `notes/review_results_phase_3.md` §round 3): high-recall
+8-angle pass; **no high/medium** findings (exactly-once core, representative-guard invariant,
+enrichment 1:1 join, and consistent ms-truncation all verified). 4 low; developer applied:
+
+- **#1 (low)** — the entity backfill's `btrim` (spaces only) diverged from `entity()`'s JS
+  `.trim()` at the 16-char sme cap boundary (the R2 whitespace gap, not applied to the
+  backfill). Fixed: `btrim(sme, E' \t\n\r\f\v')` / `btrim(system_id, …)`; re-verified 0
+  entity mismatches over all 203,596 live rows.
+- **#3 (low)** — an oracle-corroborated `category` left `error_type=''` (34+ live incidents).
+  Documented (not a stale pairing): only `category` is corroborated, from the oracle's
+  vocabulary; `error_type`/`phase` stay the deterministic classifier's output; `''` = type
+  undetermined. `enrichment.js` + aggregate INSERT + `docs/incidents-schema.md` updated.
+- **#2 (low)** — noted in code that the newest-wins `category` refresh could regress a
+  confident category to `unknown` if a fingerprint ever became mixed-category (empirically
+  never; single-category live). **#4** (msg computed per batch row) left as-is.
+
+Process note: the #2 note initially used markdown backticks inside the SQL **template
+literal**, breaking `require` — invisible to `node --test` (which never loads `incidents.js`),
+caught only by RUNNING `assess`. Fixed and re-validated by running the job (assess exit 0,
+both integration tests PASS, delta 0), not just the unit suite.
+
+Deferred findings:
+
+- None as bugs. Two upgrade paths recorded (not scheduled): the monotonic-cursor exactly-once
+  hardening (R1) and persisting `eventText` on L0 for exact sample-message parity (R2).
+  Enrichment coarseness, `apps[]` single-app structure, and `dt`/null-`dt` skew remain the
+  intentionally-deferred Phase-5 items already recorded above.
+
+Re-validation after fixes (all green):
+
+- 49/49 unit tests (long-sme parity added). Schema re-applied (default →
+  `clock_timestamp()`). `aggregate_race.js` PASS (T0 < Ta; clock row caught, tx-start
+  row skipped). `rep_determinism.js` PASS (498/498, 0 mismatches). Real `assess` exit 0.
+  Final: `error_events` 203,596 (0 null entity, 0 test leftovers); `incidents` 503 =
+  `count(distinct (fingerprint, entity))`; `sum(occurrence_count)` 203,596 →
+  **exactly-once delta 0**; watermark caught up.
+
+## Problems Encountered
+
+- The prompt's enrichment premise (join on `run_id`; fill `phase`/`modality`/`manufacturer`)
+  did not survive Step 2: `run_id` never joins the oracle and those columns don't exist on
+  `incidents`. Resolution: scoped enrichment to system_id-only category corroboration and
+  documented the reality in `docs/incidents-schema.md` and the prompt is superseded by this
+  entry. Developer-approved before implementation.
+- The prompt's "cross-app blast radius" review question rests on a false premise: `src_app_name`
+  is part of the fingerprint, so one fingerprint is single-app and `apps[]` is structurally
+  length-1. Resolution: documented; `apps[]` kept per contract/future-proofing.
+
+## Follow-Up Tasks
+
+- Codex review of this phase (handoff ready); iterate on findings; then commit Phases 0–3.
+- Phase 4 (`prompt_4_deterministic_assessor.txt`): pure `assess(dossier)` → severity/state/
+  reasons over the aggregated incidents; wire after `aggregate` in the `assess` job.
+- Phase 5: watch the source-clock skew / null-`dt` interaction when the recovery oracle
+  drives auto-close timing (this entry's timestamp decision).
+- Optional hardening (re-review, if/when clock-step tolerance is wanted): replace the
+  timestamp aggregate cursor with a monotonic post-lock `BIGSERIAL`/batch sequence — ideally
+  pipeline-wide (materialize's watermark makes the same clock assumption), so it's a
+  deliberate cross-cutting phase, not an aggregate-only patch.
+- Optional (re-review, exact sample-message parity): persist the computed `eventText` on
+  `error_events` and read it directly instead of reconstructing `msg` in SQL.
+- Open decisions unchanged: cron cadence, acquisition-v2 onboarding, self-ingestion, retention.
+
+## Commit Readiness
+
+- Requirements implemented: yes (aggregate half of `assess`, per the prompt + approved Step-2
+  design changes).
+- Write-isolation / least-privilege rules hold: yes (no new grant; writes confined; proven
+  live as `incident_engine_rw`).
+- Jobs idempotent (watermark + ON CONFLICT): yes — exactly-once proven live (delta 0 on first,
+  re-run, and incremental runs) AND under the concurrent materialize/aggregate race after the
+  round-1 high fix (post-lock `clock_timestamp()` cursor; `aggregate_race.js` PASS).
+- Assessment deterministic (no LLM in critical path): n/a (assessor is Phase 4); aggregate is
+  pure SQL; enrichment advisory.
+- Source queries read warn_error_logs only, partition-pruned: n/a for the source table this
+  phase (reads own L0 + oracle); BRIN confirmed on the L0 window scan.
+- Schema assumptions confirmed live: yes (see Schema Facts).
+- Review findings addressed or deferred: yes — three rounds
+  (`notes/review_results_phase_3.md`): round 1 (Codex) 1 high + 1 medium + 2 low, all fixed;
+  round 2 (Codex re-review) 1 medium + 1 low, both addressed; round 3 (independent
+  self-review) no high/medium, 4 low — 2 fixed, 1 noted, 1 left. Two upgrade paths recorded
+  (monotonic cursor; persisted `eventText`), neither scheduled.
+- Validation recorded: yes.
+- Ready to commit: yes — developer confirmed after round 3.
+
+---
+
 # Phase 2 — Materialize (L0)
 
 Date:

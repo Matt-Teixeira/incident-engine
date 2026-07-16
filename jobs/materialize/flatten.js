@@ -6,7 +6,7 @@
 
 const { FP_VERSION, fingerprint, eventText } = require("../../domain/fingerprint");
 const { classify } = require("../../domain/classify");
-const { deriveSystemId } = require("../../domain/entity");
+const { entity, deriveSystemId } = require("../../domain/entity");
 const { nonEmptyString } = require("../../domain/strings");
 
 // Storage caps from db/schema.sql. Truncation is STORAGE-only — the
@@ -62,6 +62,18 @@ function flattenRun({ run_id, app_name, warn_error_logs }) {
       const text = eventText(event);
       const cls = classify(text);
       const sme = nonEmptyString(note.sme);
+      // The value actually STORED in the sme column (capped to VARCHAR(16)).
+      // entity() must derive from THIS, not the uncapped sme: otherwise a >16
+      // char sme yields a long entity on new rows but a 16-char entity in the
+      // schema.sql backfill (which only sees the stored column) — splitting one
+      // incident in two (Phase 3 review, medium finding). sme is ≤8 live, so
+      // this only bites pathological input, but the two paths must agree.
+      const sme_stored = cap(sme, 16);
+      // note.system_id is authoritative when present (review finding 2); sme is
+      // the fallback. Compute once so the stored system_id and the entity are
+      // derived from the SAME value (no drift). system_id is a validated
+      // ^SME\d{5}$ token (8 chars) or null, so it needs no cap.
+      const system_id = deriveSystemId(note.system_id) ?? deriveSystemId(sme);
       // Date.parse accepts strings Postgres rejects (year 0, expanded years,
       // Date#toString output), so store the round-tripped ISO instant, never
       // the raw string — a DB-side parse error would stall the whole batch.
@@ -79,11 +91,14 @@ function flattenRun({ run_id, app_name, warn_error_logs }) {
         tag: cap(event.tag, 32),
         err_msg: nonEmptyString(event.err_msg),
         note_message: nonEmptyString(note.message),
-        sme: cap(sme, 16),
+        sme: sme_stored,
         job_id: nonEmptyString(note.job_id),
-        // note.system_id is authoritative when present (5,270 live events
-        // carry it with no sme — review finding 2); sme is the fallback.
-        system_id: deriveSystemId(note.system_id) ?? deriveSystemId(sme),
+        system_id,
+        // The incident dimension, stamped at materialize time from the tested
+        // entity() (single source of truth). The Phase 3 aggregate GROUPs on
+        // this stored value, never re-deriving it in SQL. Derived from the
+        // STORED sme/system_id so it matches the schema.sql backfill exactly.
+        entity: entity({ sme: sme_stored, system_id }),
         fingerprint: fingerprint(app_name, event, text),
         fp_version: FP_VERSION,
         error_category: cap(cls.error_category, 64),

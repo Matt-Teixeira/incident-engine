@@ -60,6 +60,7 @@ const pg_column_sets = {
                 'sme',
                 'job_id',
                 'system_id',
+                'entity',
                 'fingerprint',
                 'fp_version',
                 'error_category',

@@ -3,23 +3,23 @@ const test = require("node:test");
 const assert = require("node:assert");
 const { entity, deriveSystemId } = require("../domain/entity");
 
-test("entity fallback: sme → system_id → job_id → __global__", () => {
-  assert.strictEqual(entity({ sme: "SME01429", system_id: "s", job_id: "j" }), "SME01429");
-  // review finding 2: system_id ranks above job_id — job ids are per-run
-  // UUIDs, which would mint one incident identity per run
-  assert.strictEqual(entity({ system_id: "SME00001", job_id: "job-1" }), "SME00001");
-  assert.strictEqual(entity({ job_id: "job-1" }), "job-1");
+test("entity fallback: sme → system_id → __global__", () => {
+  assert.strictEqual(entity({ sme: "SME01429", system_id: "SME00002" }), "SME01429");
+  assert.strictEqual(entity({ system_id: "SME00001" }), "SME00001");
+  // Phase 3: no sme and no system_id → the shared __global__ bucket. job_id is
+  // NOT a fallback (per-run UUID would fracture aggregation — see entity.js).
   assert.strictEqual(entity({}), "__global__");
   assert.strictEqual(entity(), "__global__");
-  // empty / whitespace / non-string values fall through
-  assert.strictEqual(entity({ sme: " ", system_id: "", job_id: "job-2" }), "job-2");
-  assert.strictEqual(entity({ sme: 42, system_id: null, job_id: "job-3" }), "job-3");
+  // job_id is ignored even when present
+  assert.strictEqual(entity({ job_id: "any-job-uuid" }), "__global__");
+  assert.strictEqual(entity({ sme: "SME01429", job_id: "j" }), "SME01429");
+  // empty / whitespace / non-string values fall through to __global__
+  assert.strictEqual(entity({ sme: " ", system_id: "" }), "__global__");
+  assert.strictEqual(entity({ sme: 42, system_id: null }), "__global__");
 });
 
-test("entity holds a 36-char job UUID losslessly, caps at VARCHAR(64)", () => {
-  const uuid = "47762d99-dd38-449f-9831-241af25115f6";
-  assert.strictEqual(entity({ job_id: uuid }), uuid); // no truncation
-  assert.strictEqual(entity({ job_id: "x".repeat(100) }).length, 64);
+test("entity caps at VARCHAR(64) as a defensive backstop", () => {
+  assert.strictEqual(entity({ sme: "x".repeat(100) }).length, 64);
 });
 
 test("deriveSystemId: format-matching sme IS the system_id", () => {

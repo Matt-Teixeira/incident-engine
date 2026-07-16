@@ -22,8 +22,9 @@ One row per `warn_error_logs` event, fingerprinted + classified at materialize t
 | `err_msg` | TEXT | sparse (0% on hhm_rpp_ge) |
 | `note_message` | TEXT | `note.message` (err_msg fallback) |
 | `sme` | VARCHAR(16) | `note.sme` — cross-app equipment key (~46–84% by app) |
-| `job_id` | TEXT | `note.job_id` |
+| `job_id` | TEXT | `note.job_id` (stored for provenance; **not** an entity key — see `entity`) |
 | `system_id` | VARCHAR(8) | `note.system_id` when present (validated), else derived from `sme` (`^SME\d{5}$` ⇒ sme IS the system_id) |
+| `entity` | VARCHAR(64) NOT NULL | the incident dimension, stamped at materialize time by `domain/entity()`: `sme → system_id → '__global__'`. The Phase 3 aggregate GROUPs on this stored value (single source of truth; never re-derived in SQL). |
 | `fingerprint` | CHAR(40) | `sha1(app\|func\|tag\|type\|normalize(err_msg\|\|note.message\|\|note.txt\|\|note.skip_reason))` |
 | `fp_version` | SMALLINT NOT NULL | which fingerprint formula produced this row (`FP_VERSION`) — provenance for version-aware rebuilds |
 | `error_category` | VARCHAR(64) | classify output (`unknown` when unmatched) |
@@ -31,7 +32,7 @@ One row per `warn_error_logs` event, fingerprinted + classified at materialize t
 | `phase` | VARCHAR(32) | best-effort from enrichment; default '' |
 | `dt` | TIMESTAMPTZ | event `dt` |
 | `raw_event` | JSONB | the whole original event |
-| `inserted_at` | TIMESTAMPTZ | DEFAULT NOW() |
+| `inserted_at` | TIMESTAMPTZ | `DEFAULT clock_timestamp()` (insert-time, **not** transaction-start `NOW()`). This is the cursor the Phase 3 aggregate watermarks on; stamping it post-lock keeps a late-committing materialize's rows from landing below an advanced aggregate watermark (exactly-once). |
 
 - **PK `(run_id, event_ord)`** → idempotent re-materialize via `ON CONFLICT DO NOTHING`.
 - Indexes: BRIN(`inserted_at`); `(fingerprint, dt DESC)`; partial `(sme, dt DESC) WHERE sme
@@ -43,16 +44,16 @@ One row per `warn_error_logs` event, fingerprinted + classified at materialize t
 | --- | --- | --- |
 | `id` | BIGSERIAL PK | |
 | `fingerprint` | CHAR(40) | with `entity`, the identity |
-| `entity` | VARCHAR(64) | `sme` → `system_id` → `job_id` → `__global__` (system_id above job_id: job ids are per-run UUIDs; 64 holds a 36-char UUID losslessly) |
-| `occurrence_count` | BIGINT | += batch count on upsert |
-| `first_seen` / `last_seen` | TIMESTAMPTZ | LEAST / GREATEST on upsert |
-| `apps` | TEXT[] | blast radius across apps (union) |
-| `systems` | TEXT[] | affected `system_id`s (union) |
-| `sample_run_id` | UUID | representative event |
-| `sample_message` | TEXT | representative normalized message |
-| `category` | VARCHAR(64) | mirrors `error_category` |
-| `error_type` | VARCHAR(16) | |
-| `phase` | VARCHAR(32) | |
+| `entity` | VARCHAR(64) | `sme` → `system_id` → `__global__` (Phase 3 **dropped `job_id`**: a per-run UUID as entity fractures one problem into one incident per run — live, that turned 4 fingerprints into ~38k singleton incidents; 498 with it removed). 64 is a harmless backstop; live values are ≤16. |
+| `occurrence_count` | BIGINT | += batch count on upsert (additive; exactly-once — see the aggregate query header) |
+| `first_seen` / `last_seen` | TIMESTAMPTZ | LEAST / GREATEST of `COALESCE(dt, inserted_at)` on upsert (`dt` = the event's own clock; `inserted_at` fallback only for null-`dt` rows) |
+| `apps` | TEXT[] | contributing apps (union). **Structurally single-element**: `src_app_name` is part of the fingerprint, so one fingerprint is one app — kept as contract/future-proofing, not a cross-app signal at this grain |
+| `systems` | TEXT[] | affected `system_id`s (union); empty for `__global__` incidents |
+| `sample_run_id` | UUID | representative event (most recent by `dt` in the batch) |
+| `sample_message` | TEXT | representative message (human-readable `eventText` chain, not the normalized hash input) |
+| `category` | VARCHAR(64) | the representative event's `error_category`; when that is `unknown` it may be **corroborated** from the oracle (then in the oracle's vocabulary, e.g. `rsync_io_timeout` — see enrichment) |
+| `error_type` | VARCHAR(16) | the classifier's `error_type` only — **not** corroborated (the oracle has no type). `''` when the category was oracle-corroborated (type undetermined), not a stale pairing |
+| `phase` | VARCHAR(32) | `''` in Phase 3 (not enriched; per-run, uncorrelatable without a `run_id` join) |
 | `func` | VARCHAR(64) | |
 | `severity` | VARCHAR(16) | assessor: critical/high/medium/low/info |
 | `confidence` | NUMERIC(3,2) | assessor: 0..1 |
@@ -81,7 +82,13 @@ One row per `warn_error_logs` event, fingerprinted + classified at materialize t
 
 - **Source:** `util.app_run_logs.warn_error_logs` (json; partitioned; SELECT-only; never
   `verbose_log`).
-- **Enrichment + recovery oracle:** `stats.acquisition_history` (SELECT-only) — join on
-  `system_id`/`run_id` for `error_category`/`phase`/`modality`/`manufacturer`;
-  `successful_acquisition=true` with a timestamp later than an incident's `last_seen` drives
-  deterministic auto-close.
+- **Enrichment + recovery oracle:** `stats.acquisition_history` (SELECT-only). **Phase 3
+  Step-2 reality:** the source `run_id` does **not** correlate with
+  `acquisition_history.run_id` (0 of 124,361 rows matched on it), so the join is on
+  `system_id` **only** (~111/217 distinct systems match → LEFT join, most entities don't
+  enrich). `incidents` has no `modality`/`manufacturer` columns and `phase` is a per-run
+  fact we can't correlate, so Phase 3 enrichment **only corroborates `category` when the
+  deterministic classifier returned `unknown`** (advisory; classify stays primary; never
+  overwrites a confident category or writes a NULL). Time-correlated use of this oracle —
+  `successful_acquisition=true` later than an incident's `last_seen` driving deterministic
+  auto-close — is **Phase 5**, not here.

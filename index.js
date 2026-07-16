@@ -32,10 +32,15 @@ const {
 // → incidents.error_events (see jobs/materialize).
 const materialize = require("./jobs/materialize");
 
-// Phases 3-5: aggregate → incidents.incidents, deterministic assess, state
-// machine + auto-close. Stub until then.
+// L1/L2: watermark → aggregate new error_events into incidents.incidents, one
+// row per (fingerprint, entity), idempotently (see jobs/aggregate). Phase 3.
+const aggregate = require("./jobs/aggregate");
+
+// The `assess` job. Phase 3 wires its aggregation half; the deterministic
+// assessor (severity/state) is Phase 4, and auto-close is Phase 5 — both land
+// here after aggregate.
 const assess = async (run_log) => {
-  await addLogEvent(I, run_log, "assess", det, { txt: "stub - built in Phases 3-5" }, null);
+  await aggregate(run_log);
 };
 
 async function runJob(run_log, job) {

@@ -34,6 +34,7 @@ test("flattens a well-formed event with all derived fields", () => {
   assert.strictEqual(r.sme, "SME01429");
   assert.strictEqual(r.job_id, "job-1");
   assert.strictEqual(r.system_id, "SME01429");
+  assert.strictEqual(r.entity, "SME01429"); // sme wins the entity fallback
   assert.match(r.fingerprint, /^[0-9a-f]{40}$/);
   assert.strictEqual(r.fp_version, 1);
   assert.strictEqual(r.error_category, "connection_timeout");
@@ -66,8 +67,39 @@ test("missing optional fields become null (partial-index semantics)", () => {
   assert.strictEqual(r.sme, null);
   assert.strictEqual(r.job_id, null);
   assert.strictEqual(r.system_id, null);
+  // no sme and no system_id → the shared __global__ bucket (job_id is NOT a
+  // fallback, even though this event has none anyway)
+  assert.strictEqual(r.entity, "__global__");
   assert.strictEqual(r.dt, null);
   assert.strictEqual(r.error_category, "unknown"); // no text → unknown
+});
+
+test("entity derives from the STORED (16-capped) sme, matching the backfill (review medium)", () => {
+  // A pathological >16-char sme: the sme column stores 16 chars, and entity()
+  // must derive from that SAME capped value (not the uncapped one) so a newly
+  // materialized row and a schema.sql-backfilled row agree. left(cap16, 64).
+  const longSme = "SME" + "9".repeat(30); // 33 chars
+  const { rows } = flattenRun({
+    run_id: RUN_ID,
+    app_name: "hhm_rpp_ge",
+    warn_error_logs: [{ type: "WARN", func: "f", tag: "DETAILS", note: { sme: longSme } }],
+  });
+  const r = rows[0];
+  assert.strictEqual(r.sme, longSme.slice(0, 16)); // stored, capped to VARCHAR(16)
+  assert.strictEqual(r.entity, longSme.slice(0, 16)); // entity == stored sme (== backfill)
+  assert.ok(r.entity.length <= 16);
+});
+
+test("entity ignores job_id: no sme/system_id falls to __global__", () => {
+  const { rows } = flattenRun({
+    run_id: RUN_ID,
+    app_name: "data_acquisition",
+    warn_error_logs: [
+      { type: "WARN", func: "runJob", tag: "DETAILS", note: { job_id: "per-run-uuid", txt: "x" } },
+    ],
+  });
+  assert.strictEqual(rows[0].job_id, "per-run-uuid"); // still stored on the L0 row
+  assert.strictEqual(rows[0].entity, "__global__"); // ...but never the entity
 });
 
 test("invalid dt and non-object note are tolerated", () => {

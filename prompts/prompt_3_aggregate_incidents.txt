@@ -1,5 +1,23 @@
 Phase 3 - Aggregate Incidents (L1/L2)
 
+!! SUPERSEDED CLAUSES (see markdown/PHASE_LOG.md "Phase 3" for the authoritative
+!! record; changes were live-confirmed in Step 2 and developer-approved):
+!!  - Entity grain: the fallback DROPPED job_id -> `sme -> system_id -> __global__`.
+!!    job_id is a per-run UUID; keeping it fractured 4 fingerprints into ~38k
+!!    singleton incidents (498 without it). entity is now STORED on error_events
+!!    (stamped by domain/entity()), and the aggregate GROUPs on that column.
+!!  - Enrichment: the source run_id does NOT correlate with
+!!    stats.acquisition_history.run_id (0/124,361 matched). The join is system_id
+!!    ONLY, and (since incidents has no modality/manufacturer columns and phase is
+!!    an uncorrelated per-run fact) it ONLY corroborates category when classify
+!!    returned 'unknown'. phase/modality/manufacturer are NOT filled.
+!!  - Blast radius: src_app_name is part of the fingerprint, so a fingerprint is
+!!    single-app by construction -> apps[] is structurally length-1 (kept per
+!!    contract, not a cross-app signal at this grain).
+!!  - Idempotency: NO overlap lookback for the additive occurrence_count; the
+!!    aggregate serializes against materialize (locks its watermark row FOR UPDATE)
+!!    so the strict (watermark, snapshot] window is exactly-once.
+
 Goal:
 Roll error_events up into incidents.incidents - one row per (fingerprint, entity) - with
 occurrence count, cross-app blast radius, and best-effort enrichment.
