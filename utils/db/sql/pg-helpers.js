@@ -74,6 +74,16 @@ const pg_column_sets = {
         // Insert columns for the (fingerprint, entity) upsert (Phase 3 aggregate);
         // id / resolved_* / action_* / created_at / updated_at are set by defaults
         // or by later lifecycle stages, not on insert.
+        //
+        // CURRENTLY UNUSED (noted Phase 4): the Phase 3 aggregate is a set-based
+        // INSERT ... SELECT ... GROUP BY ... ON CONFLICT that never round-trips
+        // rows through JS, so it does not format against this ColumnSet — see the
+        // house-style note in utils/db/queries/incidents.js. It is kept as the
+        // declared write surface for this table and must stay accurate (`type` was
+        // added here in Phase 4 alongside the column), but nothing enforces that
+        // today. Left in place rather than removed: deleting a Phase 3 artifact is
+        // outside this phase, and a future row-at-a-time writer wants it. Flagged
+        // in notes/codex_handoff_phase_4.md.
         incidents: new pgp.helpers.ColumnSet(
             [
                 'fingerprint',
@@ -86,14 +96,50 @@ const pg_column_sets = {
                 'sample_run_id',
                 'sample_message',
                 'category',
+                'category_source',
                 'error_type',
+                'type',
                 'phase',
                 'func',
                 'severity',
                 'confidence',
                 'assessor_kind',
+                'assessor_version',
                 { name: 'assessment', cast: 'jsonb' },
                 'state',
+            ],
+            { table: pg_tables.incidents.incidents }
+        ),
+        // The Phase 4 assessor's write surface: EXACTLY the assessment columns,
+        // nothing else. This is the enforcement point for two rules at once —
+        //   * Write-Isolation: the only columns this app's assessor may touch.
+        //   * Determinism: `state` / `resolved_*` are ABSENT on purpose. The
+        //     assessor must never set incident state or auto-close (Phase 5 owns
+        //     that), and a ColumnSet that has no such column cannot write one
+        //     even if a future edit to the job tried to.
+        // `id` is cnd (condition-only): it identifies the row in the generated
+        // `WHERE v.id = t.id` and is never itself assigned. Every column carries an
+        // explicit cast because a multi-row helpers.update() builds an untyped
+        // VALUES list — without casts Postgres cannot infer numeric/smallint/jsonb.
+        incidents_assessment: new pgp.helpers.ColumnSet(
+            [
+                { name: 'id', cnd: true, cast: 'bigint' },
+                { name: 'severity', cast: 'varchar' },
+                { name: 'confidence', cast: 'numeric' },
+                { name: 'assessor_kind', cast: 'varchar' },
+                { name: 'assessor_version', cast: 'smallint' },
+                { name: 'assessment', cast: 'jsonb' },
+                // updated_at must be part of the ColumnSet, NOT appended to the
+                // generated statement: helpers.update() emits
+                // `SET ... FROM (VALUES ...) AS v(...)`, so anything appended
+                // lands AFTER the FROM clause, where a SET assignment is a
+                // syntax error. mod '^' injects the value as raw SQL, so the row
+                // supplies the literal string 'clock_timestamp()' and Postgres
+                // evaluates it per row. Raw mod is safe here precisely because
+                // the value is a fixed constant this module controls — never
+                // input. clock_timestamp() (statement time) matches the
+                // aggregate's upsert; now() would be transaction-start time.
+                { name: 'updated_at', mod: '^', cast: 'timestamptz' },
             ],
             { table: pg_tables.incidents.incidents }
         ),

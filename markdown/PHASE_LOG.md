@@ -5,6 +5,520 @@ Durable memory of what's been done and why. Newest entry at the top. Add an entr
 
 ---
 
+# Phase 4 — Deterministic Assessor (L3)
+
+Date:
+2026-07-16
+
+Status:
+Completed
+
+Prompt:
+`prompts/prompt_4_deterministic_assessor.txt` (revised 2026-07-16 pre-implementation, FLOW
+Step 3 — `notes/phase_4_reevaluation.md`)
+
+Git Commit:
+Pending
+
+Review Artifacts:
+
+- Codex handoff (round 1): `notes/codex_handoff_phase_4.md`
+- Review results (round 1): `notes/review_results_phase_4.md` (1 high, 2 medium — all three
+  confirmed against live data + producer source, all three fixed and re-validated live)
+- Codex handoff (fix round, delta): `notes/codex_handoff_phase_4_fixes.md`
+- Codex handoff (fix round 2, delta): `notes/codex_handoff_phase_4_fixes_round_2.md`
+- Review results (round 3): `notes/review_results_phase_4.md` §round 3 (**converged** — no
+  high/medium, 2 low, both fixed: a misdirecting remediation action on the invalid-provenance
+  branch, and five current-contract passages still describing the superseded type policy.
+  All prior findings verdicted closed; M1's degraded mode and RULES_VERSION=1 formally
+  accepted)
+- Review results (round 2): `notes/review_results_phase_4.md` §round 2 (2 medium + 1 low +
+  a count correction; round-1 judgment calls all resolved clean. M1 provenance-fails-quiet
+  and L1 entity-scoped parity check: fixed. M2 `unknown`+WARN → info: **escalated to the
+  developer** — the one open decision before commit)
+- Step-3 re-evaluation (pre-implementation): `notes/phase_4_reevaluation.md`
+
+## Goals
+
+- Assess every incident deterministically — severity / confidence / reasons / recommended
+  action — via a **pure** `assess(dossier)` behind a pluggable `ASSESSOR_KIND` seam a future
+  LLM could implement without reworking the pipeline.
+- Cover the WHOLE classifier vocabulary with reasoned severities; no dead branches.
+- **Non-goals (held):** no LLM implementation (seam only); the assessor must NOT set
+  incident `state` or auto-close (Phase 5); no writes outside `incidents`; identity domain
+  (`normalize.js`/`fingerprint.js`/classifier table) untouched — `FP_VERSION` stays 1.
+
+## Built
+
+- `domain/assessor/contract.js` — JSDoc typedefs (`Dossier`, `AssessResult`) + frozen
+  `SEVERITY`/`EVENT_TYPE`. The `AssessResult` shape carries **no** `state`/`resolved_*`:
+  the Phase 5 boundary is structural, not a convention.
+- `domain/assessor/rules.js` — the deterministic impl. Pure, async from day one. Dispatches
+  on the taxonomy's OWN fields (`manual_intervention`, `successful_acquisition`,
+  `error_type`) built into a category→flags map from `connection_regex.js` at require time,
+  never a hand-listed set of slugs. `RULES_VERSION = 1`; `BLAST_RADIUS_ENTITIES = 22`.
+- `domain/assessor/index.js` — the seam. `resolveKind(env)` is pure and exported so the
+  SELECTION is unit-testable; the registry is the allowlist (an unknown `ASSESSOR_KIND`
+  throws rather than silently defaulting); `getAssessor()` returns `{kind, version, assess}`.
+- `jobs/assess/index.js` — the assessment step (runs after `aggregate` in the `assess` job).
+  Holds ALL the I/O: assembles a plain dossier per incident, `await assess(dossier)`, writes
+  back only rows whose result changed. Resolves the impl once per run.
+- `utils/db/queries/assess.js` — the dossier SELECT (incl. the fingerprint-level
+  `entity_count` rollup) + the update predicate.
+- `utils/db/sql/pg-helpers.js` — new `incidents_assessment` ColumnSet: **exactly** the
+  assessment columns, so the write surface is enforced by the ColumnSet rather than by care.
+- `db/schema.sql` — `incidents.incidents.type VARCHAR(8)` + `assessor_version SMALLINT` in
+  CREATE + an idempotent Phase 4 UPGRADE (ADD IF NOT EXISTS + backfill), mirroring the
+  Phase 3 `entity` precedent. The backfill is guarded by a `DO` block that RAISEs if any
+  fingerprint ever carries >1 type.
+- `utils/db/queries/incidents.js` — the Phase 3 aggregate now writes `type`
+  (`COALESCE(inc.type, EXCLUDED.type)` on conflict: fingerprint-invariant, and self-healing).
+- `index.js` — `assess` job = `aggregate` → `assessIncidents` (order is load-bearing).
+- Tests: `test/assessor-rules.test.js` (44 new; 93 total) + `integration/assess_parity.js`
+  (live DB, not discovered by `node --test`).
+- `integration/rep_determinism.js` (Phase 3) — **fixed a footgun this phase created**: it
+  TRUNCATEs `incidents.incidents` and restored only the aggregation, so from Phase 4 onward a
+  bare run silently blanked every incident's severity. Its restore now re-assesses via the
+  real `jobs/assess` (driven with an in-memory run_log stub, so it still writes no log file or
+  self-log row). See Problems Encountered.
+- Docs: `docs/error-taxonomy.md` (category count corrected 19→20; the `assess` section
+  rewritten to the real rules), `docs/incidents-schema.md` (`type`/`assessor_version`;
+  `error_type` `''` count corrected ~39→253), `utils/db/queries/enrichment.js` (19→20),
+  `markdown/PROMPTS.md`.
+
+## Schema Facts Confirmed (live DB)
+
+Superuser, `staging`, 2026-07-16. The pipeline is cron-live (`25,55`), so these move.
+
+- 504 incidents / 82 fingerprints / 228,490 L0 events; `severity`/`state` NULL on all 504
+  before this phase.
+- **0 fingerprints carry both types** — `type` is inside the fingerprint, so denormalizing it
+  onto `incidents` is lossless. Re-proved by `db/schema.sql` on every apply.
+- `apps[]` / `systems[]` max length = **1**, confirming the prompt's blast-radius clause was
+  structurally dead (the Step-3 finding).
+- **The taxonomy holds 20 distinct `error_category` values, not 19** (22 with the caller-set
+  `unknown` / `hanging_exec`). Every doc, the prompt, and `notes/phase_4_reevaluation.md`
+  said 19. Nobody had counted. Zero categories carry inconsistent flags across their
+  multiple entries (which is what makes the first-entry-wins map well-defined).
+- **`error_type` is `''` on 253 of 504 incidents, not ~39.** The Phase 3 record's ~39 counted
+  only the oracle-corroborated rows and missed that every `unknown` incident carries `''`
+  too. Half the table. This is what makes "key on `category`" load-bearing rather than a nicety.
+- **`permission_denied_partial` carries BOTH `manual_intervention: true` and
+  `successful_acquisition: true`** — the only such category, and a head-on collision between
+  two of the prompt's rules.
+- Blast radius (entities per fingerprint): 1..59; 43 of 82 fingerprints are single-entity;
+  the wide tail is 22/27/40/42/42/46/59. Live fleet = **221 distinct entities**.
+- `occurrence_count` does **not** track impact: for `rsync_io_timeout`, `entity_count=1`
+  incidents run min 5 / avg 147 / max 428 while `entity_count=59` runs min 1 / avg 214 /
+  max 797. The value 428 recurs at nearly every blast radius — it is the cron cadence.
+
+## Important Decisions
+
+### Blast radius threshold = 22 entities (~10% of the fleet)
+
+Decision: `BLAST_RADIUS_ENTITIES = 22`; an ERROR transport fault at ≥22 entities sharing one
+fingerprint → `high`, else `medium`. Developer-approved after seeing the measured
+distributions.
+
+Reason: chosen as a **principle** (≥~10% of the live 221-entity fleet is one identical
+problem ⇒ fleet-wide, not one flaky scanner) rather than reverse-engineered to hit a target
+queue size. Thresholds of 10 / 22 / 40 were measured first (183 / 168 / 119 escalated rows).
+
+Tradeoff: **no threshold yields a small `high` queue** — the data genuinely contains a few
+very wide fingerprints, and the count is dominated by them at every threshold. At 22, ~150
+transport rows land high — but they are only ~4 DISTINCT fingerprints (184 high rows = 16
+distinct problems overall). Accepted as honest rather than papered over: severity is
+per-incident by design, 59 scanners that cannot rsync IS 59 high incidents, and any operator
+view groups by fingerprint. Recorded so a future reader does not "fix" the count by moving
+the threshold.
+
+### ~~Severity is type-aware in every family, with a WARN cap on transport~~ — SUPERSEDED (review rounds 1–2)
+
+Original decision (kept for the record, struck because both premises failed review): WARN
+never escalates on blast radius; `unknown`+WARN → info; transport+WARN → low;
+`manual_intervention`+WARN → medium. Premise: "a WARN means the run continued / the fault
+was absorbed."
+
+**That premise is FALSE** (round 1, F2 — the producers log real failures as WARN:
+`exec-hhm_data_grab.js:146` returns false on both branches of its WARN path; `JOB HALTED` is
+a WARN emitted when the rsync produced nothing). And the surviving `unknown`+WARN → info
+split fell in round 2 (M2, developer-decided 2026-07-16).
+
+**Current policy: `type` moves severity NOWHERE.** WARN lowers *confidence* only
+(manual_intervention 0.75 vs 0.9; transport 0.6 vs 0.8; file 0.6 vs 0.7; hanging_exec 0.4 vs
+0.5); `unknown` → interim medium @0.3 for both types until the confirmed hard-failure
+messages are classified out of `unknown` (follow-up phase — see Follow-Up Tasks). The
+fail-safe survives: anything not literally `'WARN'` is treated as ERROR. See Review Notes
+F2/M2 and the R1 comment in `domain/assessor/rules.js` for the full decision history.
+
+### `successful_acquisition` outranks `manual_intervention` (precedence, not table order)
+
+Decision: the data-acquired rule runs BEFORE the manual-intervention rule.
+`permission_denied_partial` (both flags) → `low`, not `high`.
+
+Reason: the prompt's two rules collide on exactly one category. `successful_acquisition: true`
+means the data WAS acquired — the pipeline lost nothing — so it must not page as high. But a
+human is flagged, so it must not be `info` either. Severity answers "how bad is this?"
+(nothing was lost); the recommended action answers "who fixes it?" (a human). `low` is the
+only cell satisfying both.
+
+Tradeoff: a human-actionable problem sits in the low queue. Accepted — it is genuinely not
+urgent, and the action string carries the instruction.
+
+### Rules dispatch on the taxonomy's fields, never on hand-listed category slugs
+
+Decision: every rule keys on `manual_intervention` / `successful_acquisition` / `error_type`
+looked up BY CATEGORY from `connection_regex.js`, built into a map at require time.
+
+Reason: keeps `connection_regex.js` the single source of truth, and a new category added
+there inherits a reasoned severity by construction instead of silently hitting the default.
+It also fixes the prompt's coverage gap by construction: the prompt hand-listed 4 transport
+categories for escalation, but the connection family has **10** — `max_retries`,
+`session_timeout`, `rsync_protocol_error`, `http2_cancel`, `connection_refused`,
+`partial_transfer_timeout` are the same kind of fault and would have fallen to the default.
+Hand-listing is precisely how the prompt came to claim 19 categories and omit the #2 one.
+
+Tradeoff: severity is now coupled to flags owned by `data_acquisition`. Acceptable — this app
+already copies that file verbatim, and the unit suite pins the built map against the table.
+
+### `occurrence_count` deliberately does NOT drive severity
+
+Decision: it stays in the dossier (contract + a future LLM impl) but no rule keys on it,
+despite the prompt naming it as a key.
+
+Reason: live data says it measures retry chattiness, not impact (see Schema Facts). There is
+no monotone relationship with blast radius, and a "singleton ⇒ one-off blip ⇒ downgrade" rule
+would be actively wrong: `entity_count=59` incidents include `occurrence_count=1` rows, so it
+would downgrade a genuine fleet-wide incident. Confirmed live: a `run` that materialized
+~1,000 new events changed no severity — occurrence counts moved, severities did not.
+
+Tradeoff: a chatty single-system problem is not escalated. Correct at this grain; revisit only
+with evidence that it tracks impact.
+
+### `assessor_version` column added (developer-approved)
+
+Decision: `incidents.assessor_version SMALLINT`, stamped per row from `RULES_VERSION`,
+mirroring the `error_events.fp_version` precedent.
+
+Reason: `assessor_kind` is not provenance — it stays `'rules'` across every rules change, so
+a severity produced by a superseded threshold is otherwise indistinguishable from a current
+one. This is the first cut of a rules table whose thresholds are expected to move.
+
+Tradeoff: a column that the assess-all design does not strictly need to *trigger*
+re-assessment (see below). Kept because provenance ("which rules produced this row?") is
+valuable independently, and it is exactly the `fp_version` precedent. Bump `RULES_VERSION`
+whenever a rule, threshold, or action string changes.
+
+### DEVIATION: assess ALL incidents every run, not `touched OR severity IS NULL`
+
+Decision: the assess step selects every incident each run and writes back only rows whose
+result changed. This departs from the prompt and from `notes/phase_4_reevaluation.md` §6.
+
+Reason: **the prompt's predicate is subtly wrong and would ship a permanent staleness bug.**
+`entity_count` is a property of the FINGERPRINT, not of the incident row. When a fingerprint
+gains its 22nd entity, that new incident is the only row "touched" — but its 21 siblings just
+crossed the threshold too and should re-assess from medium to high. A touched-only predicate
+leaves all 21 at medium forever, because nothing will ever touch them again. A row's severity
+depends on facts outside that row, so a row-local predicate cannot be correct. The same holds
+for a rules change: `touched OR severity IS NULL` never re-assesses an already-assessed
+backlog.
+
+Affordable by construction, not by luck: `incidents` is the L2 rollup — bounded by distinct
+problems × equipment (504 rows over 228k L0 events), NOT by event volume. Live cost: 20–62ms
+for the whole step. The no-op filter keeps `updated_at` from churning every 30 minutes.
+
+Tradeoff: a full scan of `incidents` per run. If that table ever grew to where this hurts, the
+fix is a bounded candidate set (touched fingerprints ∪ their siblings ∪ stale
+`assessor_version`) — NOT the row-local predicate. Recorded in `utils/db/queries/assess.js`.
+
+## Architecture Notes
+
+- **Write-isolation / least-privilege:** writes are `incidents.incidents` assessment columns
+  only, through the `incidents_assessment` ColumnSet (which has no `state`/`resolved_*`
+  column to write). No new grant — the role owns `incidents`; proven by the live runs as
+  `incident_engine_rw`. `stats.acquisition_history` is not read at all by this step.
+- **Idempotency:** no watermark, and none needed — `assess` is a pure function of the
+  dossier, so re-runnability is a property of the function rather than of bookkeeping. Proven
+  live: re-run → identical md5 over all assessments, `updated_at` unchanged, 504 assessed / 0
+  written. The Phase 3 exactly-once invariant still holds after a full `run`
+  (`sum(occurrence_count)` == L0 count, delta 0).
+- **Classifier / fingerprint stability:** untouched. `FP_VERSION` stays 1; `normalize.js` /
+  `fingerprint.js` / `connection_regex.js` unmodified — the assessor only READS the taxonomy's
+  flags. The new `type` column is a denormalization of an existing L0 fact, not a new identity
+  input.
+- **Determinism:** `assess` is pure (no DB handle, clock, network, or env read inside); all
+  I/O lives in `jobs/assess`. No LLM implementation exists — the registry has one entry and an
+  unknown `ASSESSOR_KIND` throws. The assessor sets no `state` and performs no auto-close;
+  asserted live by `integration/assess_parity.js`.
+- **Data-contract:** this step reads only `incidents.incidents` (own schema). Never
+  `verbose_log`. The aggregate's source scan is unchanged.
+- **Deployment:** no new deploy surface (same batch one-shot, same `25,55` cron `run` line).
+  **Superuser step required before deploying this code:** re-apply `db/schema.sql` (adds
+  `type` + `assessor_version`, backfills `type`). `ASSESSOR_KIND` is a new optional env var
+  (default `rules`); documented in `markdown/ENVIRONMENT.md`.
+
+## Validation
+
+Commands run:
+
+```bash
+docker run --rm -v "$PWD":/w -w /w node:lts node --test              # 93/93 pass (44 new)
+docker exec -i pg_db psql -U postgres -d staging -f - < db/schema.sql # type+assessor_version, UPDATE 504
+docker compose run --rm app node index.js assess                     # first assess: 504 written
+docker compose run --rm app node index.js assess                     # re-run: 0 written, md5 identical
+docker compose run --rm app node index.js run                        # full cron path: materialize→aggregate→assess
+docker compose run --rm app node integration/assess_parity.js        # live parity: PASS
+docker compose run --rm app node integration/aggregate_race.js       # Phase 3 regression: PASS
+docker compose run --rm app node integration/rep_determinism.js      # Phase 3 regression: PASS
+# aggregate INSERT-path proof for `type`, inside a ROLLBACK'd superuser tx (see below)
+# EXPLAIN of the new dossier SELECT; has_table_privilege matrix for incident_engine_rw
+```
+
+Results:
+
+- **Passed:** 93/93 unit tests. Schema applied idempotently; the mixed-fingerprint guard
+  passed; `type` backfilled 504/504 (0 nulls; 175 WARN / 329 ERROR). First assess wrote 504
+  rows, `severity`/`confidence`/`assessment` populated, `assessor_kind='rules'`,
+  `assessor_version=1` on every row; `state`/`resolved_*`/`action_*` NULL on all 504
+  (Phase 5 boundary intact). Re-run: 504 assessed / **0 written**, md5 over all assessments
+  identical, `max(updated_at)` unchanged. Full `run`: exactly-once delta **0** (229,532 L0 ==
+  `sum(occurrence_count)`), `type` and `severity` complete. `integration/assess_parity.js`
+  PASS — every stored assessment byte-identical to a fresh `assess()` of the same row.
+- **Severity distribution** (the "did we just relabel the firehose?" review question):
+
+  **After the review fixes** (the pre-fix numbers were high 184 / medium 148 / low 28 /
+  info 144 — see Review Notes F1):
+
+  | severity | incident rows | distinct fingerprints |
+  | --- | --- | --- |
+  | high | 184 | 16 |
+  | medium | 319 | — |
+  | low | **0** | — |
+  | info | **1** | — |
+
+  (Post-round-2/M2. The intermediate state after round 1 was 184/144/0/176; the M2 decision
+  moved the 175 unknown-resolved WARN incidents from info to interim medium.) `low` empties
+  because every incident that had been rated low was oracle-sourced (F1) and is now correctly
+  `unknown`; the surviving info row is the one `rsync_partial` (data acquired). 184 high rows
+  = 16 real problems. Provenance: 464 classifier / 40 oracle, 0 NULL — now enforced at rest
+  (NOT NULL + CHECK, negative-tested). The swollen medium queue is the M2 decision's accepted
+  cost until the classification follow-up phase lands.
+- **Failed:** none outstanding. Two defects were found and fixed DURING validation — both
+  invisible to the unit suite (see Problems Encountered).
+- **Not run:** a fault-injected demonstration of the sibling-staleness bug the assess-all
+  design prevents (reasoned + covered by the unit boundary test, not staged against live
+  data). No LLM impl exists to test the seam against a second implementation.
+
+Manual / smoke tests:
+
+- Spot-checked a fleet-wide `high`: `SME01107` / `rsync_io_timeout`, reasons name the
+  transport family, the ERROR label, and "blast radius: 27 entities … at or above the
+  22-entity threshold (~10% of the fleet)". Reads as an operator explanation, not a label.
+- Spot-checked the `credentials` split: ERROR → high @0.90, WARN → medium @0.70, both with
+  "Update the stored credentials for this host, then re-run."
+- The run summary self-logs `severity_counts` + `unresolved_categories` (empty live), so a
+  taxonomy gap surfaces in the logs rather than hiding behind a severity.
+- **The aggregate's `type` INSERT path was proven separately.** All 504 live incidents already
+  existed, so they got `type` from the UPGRADE *backfill* — the aggregate's `INSERT` column
+  only fires for a brand-new `(fingerprint, entity)`, which no run happened to produce. Proof
+  without mutating live data: inside a **ROLLBACK'd** superuser transaction, delete one
+  incident and re-run the REAL `UPSERT_INCIDENTS_SQL` (emitted from the module, not retyped)
+  over an all-time window → the row is re-INSERTed with `type='WARN'`, matching its pre-delete
+  value. Rolled back; live data verified unchanged (504 rows, 0 null types).
+- Phase 3's `integration/aggregate_race.js` and `rep_determinism.js` both still PASS — this
+  phase modified their upsert, so they are regression coverage, not decoration.
+- `EXPLAIN` of the new dossier SELECT: two seq scans + a hash join over `incidents`, total cost
+  ~106 (the deliberate assess-all full scan; the table is 504 rows). No index needed at this
+  size and none added.
+- Grant matrix re-confirmed: `incident_engine_rw` has SELECT-only on `util.app_run_logs` and
+  `stats.acquisition_history` (UPDATE = false on both) and full DML on `incidents.incidents`,
+  incl. the two new columns. **No new grant was needed** — the role owns the schema.
+
+## Review Notes
+
+Source:
+
+- `notes/review_results_phase_4.md` (Codex, from `notes/codex_handoff_phase_4.md`).
+
+Critical issues:
+
+Verdict "needs fixes": 1 high, 2 medium. **All three verified independently before fixing —
+all three real.**
+
+- **F1 (high) — oracle-only categories drove incorrect assessments.** The rules keyed on
+  `incidents.category` without regard for where it came from. Phase 3 fills an `unknown`
+  category with the latest non-unknown category for the same `system_id` — time- and
+  run-uncorrelated. Live: **40 incidents whose assessed category appears in ZERO of their own
+  L0 events**. `No new monitoring data found.` was rated `rsync_io_timeout`; `missing host_ip`
+  likewise; `File not present` → `host_unreachable`; four `No new file data` → `credentials`.
+  `enrichment.js` had said "advisory only" since Phase 3 — and nothing enforced it, while
+  `docs/incidents-schema.md` simultaneously reassured the reader that "`category` is always a
+  valid classifier category" (true of the string, irrelevant to whether it describes THIS
+  incident). The first consumer of an unenforced advisory field consumed it as evidence.
+- **F2 (medium) — WARN does not mean the operation succeeded.** Several branches asserted
+  "the run continued / the fault was absorbed" and capped severity. The producers refute it:
+  `exec-hhm_data_grab.js:146` logs a connection error **WARN** then `return false`s on both
+  branches (the success path is the one passing `successful_acquisition: true`), and
+  `JOB HALTED` (~28k events) is a **WARN** emitted when the rsync produced nothing and the job
+  returns. I flagged this exact assumption in the handoff (§5.5) and shipped it without
+  reading the producers — flagging is not verifying.
+- **F3 (medium) — the parity test shared the query it verified.** It imported the production
+  `SELECT_DOSSIERS_SQL`, so a wrong dossier is reproduced identically on both sides. F1 proves
+  it: PASS across 504 while 40 were being assessed off unrelated categories. I named this risk
+  in the handoff (§5.2) too.
+
+Accepted fixes (all three; detail in `notes/review_results_phase_4.md`):
+
+- **F1**: persist provenance — the reviewer's PRIMARY suggestion, not the interim detector.
+  New `incidents.category_source` (`classifier` | `oracle`), derived by the aggregate **from
+  the enrichment join itself** and refreshed under the identical ON CONFLICT guard as
+  `category`. New **R0** in `rules.js` assesses anything not explicitly `classifier` as
+  `unknown` (fail-safe: NULL/garbled ⇒ untrusted), surfacing the discarded category in the
+  reasons. The interim detector (`category <> 'unknown' AND error_type = ''`) was rejected for
+  runtime use: it is exact only until the **already-tracked** "populate `error_type` on
+  corroborated rows" follow-up lands, at which point it silently stops matching and the high
+  bug returns with no test failing. It is used once, in the backfill, where the join cannot be
+  replayed. → 32 severities changed; **high 184 / medium 144 / info 176** (low → 0), matching
+  the reviewer's predicted numbers exactly.
+- **F2**: WARN now costs **confidence, never severity** — no branch caps on it
+  (manual_intervention+WARN medium→**high** @0.75; transport+WARN low→**blast-radius split**
+  @0.6; file+WARN low→**medium**; hanging_exec+WARN low→**medium**). Every recovery claim
+  removed from the reason strings, replaced with the fact. A test sweeps all 22 categories ×
+  WARN and fails on any reason matching `/absorbed|run continued|survived/i`. **Live impact:
+  zero rows** — every transport/manual-intervention WARN incident turned out to be
+  oracle-sourced (F1), so the caps were live dead code. Luck, not design: the first genuine
+  classifier-backed WARN transport incident would have been mis-rated.
+- **F3**: parity test rewritten with **independent SQL** — correlated `count(DISTINCT entity)`
+  instead of the job's CTE; `type` read back from L0; `category_source` cross-checked against
+  L0 (a `classifier` category MUST appear in the incident's own events, an `oracle` one must
+  NOT); an oracle category must resolve to `unknown`. The file now carries an explicit
+  independence rule: importing from `utils/db/queries/assess.js` is the bug it detects.
+
+Found while fixing (not raised by the review):
+
+- **A backtick inside the SQL template literal broke `require()` — the identical defect Phase 3
+  hit, in the same file** (PHASE_LOG Phase 3 §Process note). `node index.js assess` died at
+  require time with **101/101 green**, because no unit test loads a SQL module. Twice is a
+  pattern and "remember not to type a backtick" is not a control → added
+  **`test/sql-modules-load.test.js`**: requires every SQL-owning module, asserts exports are
+  non-empty backtick-free strings, plus structural landmarks. **Verified by re-injecting the
+  real bug (guard fails) and removing it (passes).** It would have caught both incidents.
+
+Deferred findings:
+
+- `pg_column_sets.incidents.incidents` is **dead code** (noticed this phase): the Phase 3
+  aggregate is set-based SQL and never formats against it, so nothing enforces that it
+  matches the table. Kept accurate (`type` added) rather than deleted — removing a Phase 3
+  artifact is outside this phase. Flagged in the handoff.
+- `error_type` on oracle-corroborated rows is still `''` (the Phase 3 follow-up). Phase 4 no
+  longer *needs* it (rules key on `category`), which lowers its priority but does not close
+  it — the column is still half-empty and still misleading to any future consumer.
+
+## Problems Encountered
+
+- **The prompt's assess-scope predicate is incorrect** (`touched OR severity IS NULL`).
+  Resolution: implemented assess-all + no-op-write filter; reasoned in
+  `utils/db/queries/assess.js` and in Important Decisions above. This one is a design bug in
+  the phase spec, not a mistake in it being followed.
+- **Three assertions repeated across the docs were simply wrong**, and none had been checked:
+  "19 categories" (it is 20 / 22), "`error_type` is `''` on ~39 rows" (253), and the implicit
+  assumption that `manual_intervention` and `successful_acquisition` never co-occur (they do,
+  on `permission_denied_partial`). Resolution: verified in Step 2, corrected in the docs, and
+  pinned by unit tests so they cannot drift silently again. Same failure mode as the Phase 3
+  taxonomy correction (commit 747e0cc): a confident claim nobody counted.
+- **A 42601 syntax error on the very first live `assess` run, with a green 93/93 suite.**
+  `updated_at = clock_timestamp()` was appended to the string returned by
+  `pgp.helpers.update()`, which lands AFTER the `FROM (VALUES …) AS v` clause — a SET
+  assignment cannot go there. Resolution: `updated_at` moved into the `incidents_assessment`
+  ColumnSet (raw `mod: '^'`), and the query file now says only the WHERE predicate may ever be
+  appended. **Exactly the Phase 3 lesson** — `node --test` never loads the SQL modules, so
+  only running the job could catch it.
+- **A grammar bug in operator-facing text** ("1 entity share this fingerprint"), visible only
+  by reading the rows the job actually wrote. Fixed; the 25 affected single-entity rows
+  re-converged on the next run (which is itself a live demonstration of the no-op filter and
+  the re-assess path working).
+- **This phase turned a Phase 3 integration test into a destructive one, and the validation
+  step itself tripped it.** `integration/rep_determinism.js` TRUNCATEs `incidents.incidents`
+  and restores "a correct full aggregation" — which was a COMPLETE restore in Phase 3, when
+  aggregation was everything the table held. Phase 4 added assessment columns the aggregate
+  does not write, so running it (as the review checklist's regression step) silently blanked
+  the severity of all 504 incidents. Caught only because `integration/assess_parity.js` was
+  run afterwards and reported `never-assessed: 504` — a checklist pass would have looked
+  green. Resolution: the test's restore now calls the real `jobs/assess`, verified by running
+  it and re-checking parity (504 assessed, identical distribution). **Note for Phase 5:** the
+  restore works only because assessment is a pure function of L0-derived facts. Lifecycle
+  `state`/`resolved_*` will NOT be re-derivable that way, so that TRUNCATE becomes genuinely
+  lossy and the test needs reworking (snapshot-and-restore or a scratch table), not another
+  patch. Flagged in the test header.
+
+## Follow-Up Tasks
+
+- Codex review of this phase (handoff ready); iterate on findings; then commit.
+- Phase 5 (`prompt_5_state_autoclose.txt`): lifecycle state + deterministic auto-close via the
+  `successful_acquisition` recovery oracle. **The assessor must stay out of it** — `state` is
+  Phase 5's alone. Note that `severity` is now available as an input to state decisions.
+- If/when the rules table changes: bump `RULES_VERSION`. The assess-all design re-assesses
+  automatically on the next cron run; `assessor_version` makes the change detectable in the
+  data.
+- **DECIDED (developer, 2026-07-16, round-2 M2): `unknown`+WARN → interim MEDIUM.**
+  175 incidents / 148,429 events (round 2 corrected an earlier "176 (~145k)" — that swept in
+  the one `rsync_partial` info incident) were at info + "No action" although the bucket
+  contains confirmed hard failures (`JOB HALTED` 28,291 events; `NO TUNNEL FOUND` 13,394).
+  Options weighed: interim medium (chosen — reviewer's explicit fallback; honest severity,
+  swollen medium queue ~319 until classification); interim low (cleaner queue, still
+  type-reduced); classify now (the real fix, but edits the frozen `data_acquisition`-owned
+  classifier — a declared non-goal); keep info (reviewer on record against). Applied live:
+  175 rewritten → **high 184 / medium 319 / info 1**; re-run 0.
+- **QUEUED FOLLOW-UP PHASE: classify the confirmed hard-failure messages out of `unknown`.**
+  Round-3 requirements folded in: that phase must also REMOVE/UPDATE the interim-M2 reason
+  string in `rules.js` R1 (it claims "medium until these messages are classified" — stale the
+  moment they are) and **bump `RULES_VERSION`**.
+  The durable M2 fix. Candidates: `JOB HALTED`, `NO TUNNEL FOUND`, the missing-data and
+  ENOENT/TypeError families — each needs its producer context read (the way F2 was verified)
+  to decide failure-vs-status per message. `error_category` is NOT in the fingerprint, so new
+  patterns re-label without re-bucketing and `FP_VERSION` is untouched; existing incidents
+  pick the new category up as fresh events refresh the representative (JOB HALTED recurs every
+  cron cycle, so convergence is fast). It IS a deliberate divergence of our copied
+  `connection_regex.js` from `data_acquisition`'s production vocabulary — coordinate or
+  upstream it. When it lands, the medium queue deflates and `unknown` shrinks to genuinely
+  unrecognized messages.
+- **Populate `error_type` on oracle-corroborated rows** (the Phase 3 follow-up) is now
+  LOWER value and HIGHER risk than it looked: Phase 4 keys on `category` + `category_source`,
+  so nothing needs it — and the `db/schema.sql` Phase 4 backfill uses
+  `error_type = ''` as its one-time oracle signature. Landing that follow-up would make the
+  BACKFILL a no-op on any database that had not yet run it. Runtime provenance is derived from
+  the join and is unaffected, but re-read that backfill comment before doing it.
+- Consider whether `critical` should ever be emitted. Declared but unused — nothing in the
+  taxonomy currently distinguishes a worse-than-fleet-wide fault. Left reserved deliberately.
+- Watch the `high` queue against operator reality: 184 rows / 16 problems is defensible at
+  this grain, but it is the phase's most debatable call and the first thing to revisit once
+  anyone actually *uses* the queue (an `ops-dashboard` incidents view grouping by fingerprint
+  is the natural consumer).
+- Open decisions unchanged: acquisition-v2 onboarding, self-ingestion, retention.
+
+## Commit Readiness
+
+- Requirements implemented: yes — per the revised prompt, plus three Step-2 corrections and
+  one reasoned, documented deviation (assess-scope).
+- Write-isolation / least-privilege rules hold: yes — assessment columns only, enforced by the
+  ColumnSet; no new grant; proven live as `incident_engine_rw`.
+- Jobs idempotent (watermark + ON CONFLICT): yes — purity gives re-runnability without a
+  watermark (re-run: 0 written, md5 identical); Phase 3's exactly-once invariant still holds
+  after a full `run` (delta 0).
+- Assessment deterministic (no LLM in critical path): yes — `assess` is pure and unit-tested;
+  no LLM impl exists; an unknown `ASSESSOR_KIND` throws; the assessor writes no `state`
+  (asserted live).
+- Source queries read warn_error_logs only, partition-pruned: n/a this step (reads own
+  `incidents.incidents`); the aggregate's scan is unchanged.
+- Schema assumptions confirmed live: yes — and three documented assumptions were found FALSE
+  and corrected (see Schema Facts).
+- Review findings addressed or deferred: **two rounds complete** (Codex). Round 1: 1 high + 2 medium, all fixed. Round 2 (re-review of the fixes): 2 medium + 1 low — M1 (provenance fails quiet → NOT NULL + CHECK at rest, three-way LOUD gate in R0, negative-tested live) and L1 (parity provenance check now scoped to the full (fingerprint, entity) key — 9 live mixed-category fingerprints made this real) fixed; count corrected (175/148,429, not 176/~145k). M2 (`unknown`+WARN → info on confirmed halts) was decided by the developer (2026-07-16): interim medium for both types; classification follow-up phase queued.
+- Validation recorded: yes, incl. the two defects found by running the job rather than the
+  tests.
+- Ready to commit: **yes** — three review rounds, converged (1 high + 2 medium → 2 medium + 1 low + 1 developer decision → 2 low; every finding fixed, decided, or formally accepted). All validation green: 114/114 unit; independent parity PASS; re-run 0; exactly-once delta 0; constraint negative-tested. The classification follow-up phase is queued (with the round-3 reason-string + RULES_VERSION requirements), not blocking.
+
+---
+
 # Phase 3 — Aggregate Incidents (L1/L2)
 
 Date:

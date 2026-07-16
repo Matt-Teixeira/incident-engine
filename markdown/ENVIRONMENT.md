@@ -19,10 +19,10 @@ copy-pasteable template.
 | `PGPASSWORD` / `PG_PW` | DB password for the role. **Never** appears in docs/commits. |
 | `PG_SSLMODE` | `disable` / `require` / `verify-ca` / `verify-full`. **This app deploys `verify-full`** (CA + hostname, fail-closed: a missing/unreadable CA aborts the run rather than downgrading). `require` (encrypted, unauthenticated) is a documented trust-boundary exception, not a default. |
 | `PG_SSL_PATH` | CA cert path for `verify-*` modes (shared host cert `/opt/resources/ssl/pg_ssl.crt`). |
-| `ASSESSOR_KIND` | Which assessor implementation to use. Default **`rules`** (the only one now). A future `llm` value selects the advisory implementation of the same `assess(dossier)` interface. |
+| `ASSESSOR_KIND` | Which assessor implementation to use. Default **`rules`** (the only one that exists — Phase 4). Unset/blank ⇒ `rules`; an **unrecognized value throws** and fails the run rather than silently defaulting (`domain/assessor/index.js`). A future `llm` value would select an **advisory** implementation of the same `assess(dossier)` interface — it never drives incident `state`. |
 | `MATERIALIZE_OVERLAP_MS` | Watermark overlap lookback for the materialize scan. Default **30000** (30s): the overlap is the only protection against a producer row whose INSERT→commit gap outlives it (statement-time `inserted_at`, commit-time visibility) — such a row is skipped silently and permanently once source retention expires. Re-scanned rows are absorbed by `ON CONFLICT`. |
 | `MATERIALIZE_BATCH_ROWS` | Max source rows per insert chunk (bounds memory). |
-| `ASSESS_WINDOW_HOURS` | (optional) Bound for how far back `assess` re-evaluates open incidents / recovery. |
+| `ASSESS_WINDOW_HOURS` | (optional, **not yet read by any code**) Reserved for Phase 5: how far back auto-close re-evaluates open incidents against the recovery oracle. Phase 4's assessment step deliberately takes **no** window — it re-assesses every incident each run, because blast radius is a fingerprint-level property and a row-local/windowed predicate leaves an untouched row's severity stale forever (see `utils/db/queries/assess.js` and PHASE_LOG Phase 4). |
 
 ## Rules
 

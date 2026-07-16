@@ -78,12 +78,51 @@ CREATE TABLE IF NOT EXISTS incidents.incidents(
     sample_run_id UUID,
     sample_message TEXT,
     category VARCHAR(64),
+    -- Where `category` came from: 'classifier' (this incident's own events matched
+    -- a pattern) or 'oracle' (they did not; this is the latest UNRELATED category
+    -- for the same system_id, via stats.acquisition_history — time- and
+    -- run-uncorrelated). Added Phase 4 (review, HIGH): the two are not
+    -- interchangeable and storing only the category hid that. The assessor must
+    -- not treat an oracle category as evidence about this problem — live, all 40
+    -- oracle-sourced incidents carry a category absent from their own L0 events.
+    -- NOT NULL + CHECK (review round 2, medium): the assessor's gate keys on this
+    -- value, so a NULL or typo'd provenance is a WRITER BUG that must be
+    -- impossible at rest — not a state the rules have to guess about. The
+    -- aggregate always writes one of the two values (CATEGORY_SOURCE_EXPR), so
+    -- the constraint costs nothing on the happy path.
+    -- See utils/db/queries/enrichment.js.
+    category_source VARCHAR(16) NOT NULL
+        CONSTRAINT chk_incidents_category_source
+        CHECK (category_source IN ('classifier', 'oracle')),
     error_type VARCHAR(16),
+    -- WARN/ERROR — the producing app's own label, denormalized from
+    -- error_events by the Phase 3 aggregate (Phase 4). LOSSLESS: type is inside
+    -- the fingerprint (sha1(app|func|tag|type|normalize(text))), so one
+    -- fingerprint carries exactly one type — live-verified: 0 fingerprints
+    -- carry both. The assessor reads it without joining back to L0 — but since
+    -- review round 2 (M2) it feeds CONFIDENCE and REASONS only, never severity
+    -- (producers log real failures as WARN, so the label is not an outcome
+    -- signal — see docs/error-taxonomy.md, "What type does NOT mean").
+    -- NULLABLE ON PURPOSE (unlike error_events.entity, which is NOT NULL): an
+    -- incident is the DURABLE rollup and error_events is the volatile layer
+    -- (this app "persists its own durable rollups rather than assuming long
+    -- history upstream" — Data-Contract Rule). An incident whose L0 events are
+    -- someday aged out has nothing to backfill from, so SET NOT NULL would make
+    -- re-applying this file fail on exactly the databases that need it most.
+    -- The assessor treats a null/garbled type as ERROR (fail-safe, never
+    -- silently downgrades) — domain/assessor/rules.js.
+    type VARCHAR(8),
     phase VARCHAR(32),
     func VARCHAR(64),
     severity VARCHAR(16),
     confidence NUMERIC(3,2),
     assessor_kind VARCHAR(16),
+    -- which RULES CONTENT produced the stored severity (domain/assessor/rules.js
+    -- RULES_VERSION), mirroring the error_events.fp_version precedent.
+    -- assessor_kind alone is not provenance: it stays 'rules' across every
+    -- rules-table change, so a severity from a superseded threshold is otherwise
+    -- indistinguishable from a current one.
+    assessor_version SMALLINT,
     assessment JSONB,
     state VARCHAR(16),
     resolved_at TIMESTAMPTZ,
@@ -187,3 +226,105 @@ ALTER TABLE incidents.error_events ALTER COLUMN entity SET NOT NULL;
 -- watermark advanced while it was mid-transaction. Existing rows keep their
 -- historical inserted_at (already aggregated); only new inserts are affected.
 ALTER TABLE incidents.error_events ALTER COLUMN inserted_at SET DEFAULT clock_timestamp();
+
+-- Phase 4: the assessor's two new columns on incidents.incidents.
+--
+--   type             — the producer's WARN/ERROR label, denormalized from L0 so
+--                      the assessor can read it without joining to error_events
+--                      (confidence and reasons only, never severity — round-2
+--                      M2). See the CREATE above for why it is lossless and why
+--                      it stays NULLABLE.
+--   assessor_version — which rules content produced the stored severity
+--                      (RULES_VERSION), mirroring error_events.fp_version.
+--
+-- Both are additive and nullable, so ADD COLUMN IF NOT EXISTS is metadata-only
+-- (no table rewrite) and re-applying this file is a no-op. On a fresh install the
+-- CREATE above already declared them, so the ADDs skip and the backfill below
+-- matches nothing (the table is empty).
+ALTER TABLE incidents.incidents ADD COLUMN IF NOT EXISTS type VARCHAR(8);
+ALTER TABLE incidents.incidents ADD COLUMN IF NOT EXISTS assessor_version SMALLINT;
+ALTER TABLE incidents.incidents ADD COLUMN IF NOT EXISTS category_source VARCHAR(16);
+
+-- Phase 4 (review, HIGH finding): backfill `category_source` for incidents
+-- aggregated before the column existed. Going-forward rows are written by the
+-- aggregate from the enrichment join itself (CATEGORY_SOURCE_EXPR).
+--
+-- THE BACKFILL SIGNATURE IS ONLY VALID AT THIS INSTANT, AND ONLY HERE.
+-- We cannot re-run the oracle join retroactively (it reads "the latest category
+-- for this system", which has since moved on), so the backfill uses the one
+-- signature that identifies an oracle category on EXISTING rows:
+--   category <> 'unknown' AND error_type = ''
+-- This is exact *today* because classify() returns error_type '' for exactly the
+-- 'unknown' case, so a classifier-sourced category always carries a non-empty
+-- error_type. It is NOT durable: populating error_type on corroborated rows is a
+-- tracked Phase 3 follow-up, and landing it would make this signature match
+-- nothing. That is precisely why going-forward provenance comes from the JOIN
+-- (enrichment.js) and not from this predicate — this runs once per existing row
+-- and then never matters again. Live at write time: 40 rows matched.
+UPDATE incidents.incidents
+   SET category_source = CASE
+         WHEN category <> 'unknown' AND COALESCE(error_type, '') = '' THEN 'oracle'
+         ELSE 'classifier'
+       END
+ WHERE category_source IS NULL;
+
+-- Round-2 hardening (review, medium): after the backfill, provenance is complete,
+-- so lock it — a NULL or out-of-vocabulary category_source is a writer/migration
+-- bug the assessor should never have to interpret. SET NOT NULL is idempotent;
+-- the CHECK is guarded because ADD CONSTRAINT has no IF NOT EXISTS. Fresh
+-- installs already carry both from the CREATE above (same constraint name, so
+-- the guard sees it and skips).
+--
+-- MIGRATION-ORDER GUARANTEE (review round 2, judgment call): the one-time
+-- backfill above keys on error_type = '' — a signature that dies when the
+-- tracked "populate error_type on corroborated rows" follow-up lands. That is
+-- safe STRUCTURALLY, not by convention: migrations live in this single file,
+-- applied top-to-bottom, so any future error_type-population section is
+-- necessarily written BELOW this one and runs after provenance is complete and
+-- NOT NULL. Whoever writes that section: it must not touch category_source,
+-- which by then is already locked.
+ALTER TABLE incidents.incidents ALTER COLUMN category_source SET NOT NULL;
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'chk_incidents_category_source'
+      AND conrelid = 'incidents.incidents'::regclass
+  ) THEN
+    ALTER TABLE incidents.incidents
+      ADD CONSTRAINT chk_incidents_category_source
+      CHECK (category_source IN ('classifier', 'oracle'));
+  END IF;
+END $$;
+
+-- One-time backfill of `type` for incidents aggregated BEFORE the column existed
+-- (live: the 504-incident Phase 3 backlog). Going-forward rows are written by the
+-- aggregate itself (utils/db/queries/incidents.js), exactly as entity() stamps
+-- error_events.entity — this is the migration path only.
+--
+-- CORRECTNESS: the DISTINCT sub-select yields exactly one row per fingerprint
+-- because type is part of the fingerprint, so this UPDATE cannot be
+-- nondeterministic (a Postgres UPDATE ... FROM with multiple matching rows would
+-- silently pick one). Live-verified before writing this: zero fingerprints carry
+-- more than one type. The DO block below re-proves that invariant on every
+-- apply rather than trusting the one-time measurement — if a future FP_VERSION
+-- ever removed type from the fingerprint, this backfill would become
+-- order-dependent and must fail loudly instead of quietly picking a type.
+DO $$
+DECLARE
+  mixed int;
+BEGIN
+  SELECT count(*) INTO mixed FROM (
+    SELECT fingerprint FROM incidents.error_events
+    GROUP BY fingerprint HAVING count(DISTINCT type) > 1
+  ) x;
+  IF mixed > 0 THEN
+    RAISE EXCEPTION 'incidents.incidents.type backfill is unsafe: % fingerprint(s) carry more than one type. type must be inside the fingerprint for this denormalization to be lossless.', mixed;
+  END IF;
+END $$;
+
+UPDATE incidents.incidents i
+   SET type = e.type
+  FROM (SELECT DISTINCT fingerprint, type FROM incidents.error_events) e
+ WHERE i.fingerprint = e.fingerprint
+   AND i.type IS NULL;

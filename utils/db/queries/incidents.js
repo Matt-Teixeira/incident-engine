@@ -51,7 +51,7 @@
 //     Idempotency Rule's re-run/crash scope; documented in PHASE_LOG.)
 "use strict";
 
-const { SYS_ENRICH_CTE, FINAL_CATEGORY_EXPR } = require("./enrichment");
+const { SYS_ENRICH_CTE, FINAL_CATEGORY_EXPR, CATEGORY_SOURCE_EXPR } = require("./enrichment");
 
 // $1 = watermark (exclusive lower bound), $2 = snapshot (inclusive upper).
 const UPSERT_INCIDENTS_SQL = `
@@ -65,6 +65,14 @@ WITH batch AS (
     event_ord,
     error_category,
     error_type,
+    -- the producer's WARN/ERROR label, denormalized onto the incident (Phase 4)
+    -- so the assessor can read it without joining back to L0 (it feeds the
+    -- assessor's confidence and reasons only, never severity -- round-2 M2).
+    -- Lossless: type
+    -- is inside the fingerprint, so every row of a (fingerprint, entity) group
+    -- carries the SAME type — which is why it can ride along on the
+    -- representative below without an aggregate function.
+    type,
     func,
     -- lifecycle clock: the event's own dt (when it actually happened), with
     -- L0 inserted_at as the fallback only for the (currently zero) null-dt
@@ -120,7 +128,7 @@ rep AS (
   -- never needs to cross batches (Phase 3 review, low finding).
   SELECT DISTINCT ON (fingerprint, entity)
     fingerprint, entity, run_id, system_id, msg,
-    error_category, error_type, func
+    error_category, error_type, type, func
   FROM batch
   ORDER BY fingerprint, entity, ts DESC, run_id DESC, event_ord DESC
 ),
@@ -128,23 +136,31 @@ ${SYS_ENRICH_CTE},
 enriched AS (
   SELECT
     rep.*,
-    ${FINAL_CATEGORY_EXPR} AS final_category
+    ${FINAL_CATEGORY_EXPR} AS final_category,
+    -- provenance of final_category (Phase 4 review, HIGH): 'classifier' | 'oracle'
+    ${CATEGORY_SOURCE_EXPR} AS category_source
   FROM rep
   LEFT JOIN sys_enrich se USING (system_id)
 )
 INSERT INTO incidents.incidents AS inc (
   fingerprint, entity, occurrence_count, first_seen, last_seen,
   apps, systems, sample_run_id, sample_message,
-  category, error_type, phase, func
+  category, category_source, error_type, type, phase, func
 )
 SELECT
   a.fingerprint, a.entity, a.occurrence_count, a.first_seen, a.last_seen,
   COALESCE(a.apps, '{}'::text[]), COALESCE(a.systems, '{}'::text[]),
   e.run_id, e.msg,
   e.final_category,         -- may be oracle-corroborated (enrichment.js)
+  e.category_source,        -- 'classifier' | 'oracle' — WHICH of the two the
+                            -- category above actually came from. The assessor
+                            -- refuses to treat 'oracle' as evidence (Phase 4
+                            -- review, HIGH finding).
   e.error_type,             -- classifier's only; NOT corroborated ('' when the
                             -- category was corroborated — no category→type
                             -- lookup here; see enrichment.js)
+  e.type,                   -- WARN/ERROR (Phase 4): fingerprint-invariant, so
+                            -- the representative's value IS the group's value
   '',                       -- phase: not enriched in Phase 3 (see enrichment.js)
   e.func
 FROM agg a
@@ -178,7 +194,24 @@ ON CONFLICT (fingerprint, entity) DO UPDATE SET
   sample_run_id  = CASE WHEN EXCLUDED.last_seen > inc.last_seen OR (EXCLUDED.last_seen = inc.last_seen AND EXCLUDED.sample_run_id > inc.sample_run_id) THEN EXCLUDED.sample_run_id  ELSE inc.sample_run_id  END,
   sample_message = CASE WHEN EXCLUDED.last_seen > inc.last_seen OR (EXCLUDED.last_seen = inc.last_seen AND EXCLUDED.sample_run_id > inc.sample_run_id) THEN EXCLUDED.sample_message ELSE inc.sample_message END,
   category       = CASE WHEN EXCLUDED.last_seen > inc.last_seen OR (EXCLUDED.last_seen = inc.last_seen AND EXCLUDED.sample_run_id > inc.sample_run_id) THEN EXCLUDED.category       ELSE inc.category       END,
+  -- MUST use the identical guard to the category refresh directly above: the two
+  -- are one fact split across two columns, and a refresh that moved one without
+  -- the other would label a classifier category 'oracle' (or worse, vice versa —
+  -- silently restoring the HIGH bug this column exists to prevent).
+  -- (No backticks in this comment ON PURPOSE: it lives inside a JS template
+  -- literal, so a markdown backtick terminates the string and breaks require() —
+  -- invisible to node --test, which never loads this file. Phase 3 hit this; so
+  -- did Phase 4's review-fix round, right here.)
+  category_source = CASE WHEN EXCLUDED.last_seen > inc.last_seen OR (EXCLUDED.last_seen = inc.last_seen AND EXCLUDED.sample_run_id > inc.sample_run_id) THEN EXCLUDED.category_source ELSE inc.category_source END,
   error_type     = CASE WHEN EXCLUDED.last_seen > inc.last_seen OR (EXCLUDED.last_seen = inc.last_seen AND EXCLUDED.sample_run_id > inc.sample_run_id) THEN EXCLUDED.error_type     ELSE inc.error_type     END,
+  -- type is NOT guarded by the representative order like the fields above, and
+  -- deliberately so: it is FINGERPRINT-INVARIANT (type is inside the
+  -- fingerprint), so every batch's representative necessarily carries the same
+  -- value and "newest wins" would be a no-op dressed up as a decision. COALESCE
+  -- instead makes this self-healing: an incident left with a NULL type (Phase 4
+  -- backfill found no surviving L0 rows for its fingerprint) is filled in by the
+  -- next batch that touches it, and a non-null value is never overwritten.
+  type           = COALESCE(inc.type, EXCLUDED.type),
   func           = CASE WHEN EXCLUDED.last_seen > inc.last_seen OR (EXCLUDED.last_seen = inc.last_seen AND EXCLUDED.sample_run_id > inc.sample_run_id) THEN EXCLUDED.func            ELSE inc.func            END,
   updated_at = clock_timestamp()
 -- xmax = 0 on a freshly inserted tuple, non-zero on a conflict-updated one:

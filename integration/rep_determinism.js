@@ -7,14 +7,40 @@
 // It rebuilds incidents.incidents two ways over the SAME L0 data and diffs the
 // representatives. It TRUNCATEs incidents.incidents (the app owns it; no live
 // consumer yet) and restores a correct full aggregation + watermark at the end.
+//
+// ⚠ DESTRUCTIVE — READ BEFORE RUNNING (updated Phase 4):
+// The TRUNCATE destroys everything on incidents.incidents that is NOT re-derived
+// by the aggregate. In Phase 3 that was nothing (aggregation was all the table
+// held), so this test was self-restoring. Phase 4 added the ASSESSMENT columns
+// (severity / confidence / assessment / assessor_kind / assessor_version), which
+// the aggregate does NOT write — so the restore below leaves every incident
+// UNASSESSED. This is not data loss (the assessor is a pure function of the
+// dossier, so `node index.js assess` rebuilds all of it exactly), but a bare run
+// of this test silently blanks the severity of every incident until the next
+// cron `run` at :25/:55.
+//
+// The finally block therefore re-assesses as part of the restore. Phase 5 will
+// add lifecycle state (state / resolved_*) that is NOT a pure function of L0 —
+// once that exists, this TRUNCATE becomes genuinely lossy and this test must be
+// reworked (snapshot-and-restore, or a scratch table) rather than patched again.
 "use strict";
 
 const db = require("../utils/db/pg-pool");
 const { UPSERT_INCIDENTS_SQL } = require("../utils/db/queries/incidents");
 const { ADVANCE_WATERMARK_SQL } = require("../utils/db/queries/materialize");
+// Phase 4: the restore must re-assess, or this test leaves every incident with a
+// NULL severity. Driving the REAL job (rather than reimplementing it here) is the
+// point — a restore that drifts from the shipping assessor would be worse than none.
+const assessIncidents = require("../jobs/assess");
 
 const AGG_KEY = "incidents.error_events";
 const EPOCH = new Date(0);
+
+// A run_log the logger primitives accept but that goes nowhere: startTimer/
+// endTimer no-op without `timers`, and addLogEvent only needs `run_id` +
+// `log_events`. Nothing is flushed (no writeLogEvents/dbInsertLogEvents call), so
+// this test still writes no log file and no self-log row.
+const silentRunLog = () => ({ run_id: null, log_events: [], timers: new Map() });
 
 const snapshotReps = () =>
   db.any(
@@ -60,7 +86,7 @@ async function main() {
     }
     check(mismatches === 0, `representatives identical across rebuild vs incremental (${mismatches} mismatches)`);
   } finally {
-    // restore: full aggregation + watermark to a fresh snapshot.
+    // restore: full aggregation + watermark to a fresh snapshot, THEN re-assess.
     await db.none("TRUNCATE incidents.incidents");
     const { s } = await db.one("SELECT clock_timestamp() AS s");
     await db.any(UPSERT_INCIDENTS_SQL, [EPOCH, s]);
@@ -70,6 +96,12 @@ async function main() {
     );
     await db.one("UPDATE incidents.pipeline_state SET last_inserted_at=to_timestamp(0) WHERE source_key=$1 RETURNING source_key", [AGG_KEY]);
     await db.one(ADVANCE_WATERMARK_SQL, [AGG_KEY, s]);
+    // Phase 4: the aggregate restores everything it DERIVES, but the assessment
+    // columns are the assessor's output and would otherwise stay NULL until the
+    // next cron `run`. Re-assessing here makes the test's restore complete again,
+    // as it was in Phase 3. Safe to call unconditionally: assess is a pure
+    // function of the dossier, so this reproduces the exact prior state.
+    await assessIncidents(silentRunLog());
     await db.$pool.end();
   }
   console.log(failures === 0 ? "\nREP DETERMINISM: PASS" : `\nREP DETERMINISM: FAIL (${failures})`);

@@ -22,8 +22,11 @@
 //     VOCABULARY (verified 2026-07-16): the oracle's error_category values ARE
 //     our classifier's vocabulary — stats.acquisition_history is written by
 //     data_acquisition using the same connection_regex.js this app copied
-//     verbatim, and its 9 distinct live values are a subset of our 19 (+
-//     'unknown'). So a corroborated category IS a valid classifier category, and
+//     verbatim, and its 9 distinct live values are a subset of our 20 (+
+//     'unknown'). ("19" here and in the Phase 3 record was a miscount of the
+//     table, corrected in Phase 4 Step 2 — the classifier holds 20 distinct
+//     error_category values. See docs/error-taxonomy.md.)
+//     So a corroborated category IS a valid classifier category, and
 //     deriving its error_type from the classifier table is POSSIBLE — it is
 //     simply not done here. (An earlier comment claimed the vocabularies differ
 //     and that derivation was impossible; that was wrong. Populating error_type
@@ -57,4 +60,36 @@ const FINAL_CATEGORY_EXPR = `
       ELSE rep.error_category
     END`;
 
-module.exports = { SYS_ENRICH_CTE, FINAL_CATEGORY_EXPR };
+// PROVENANCE of the category FINAL_CATEGORY_EXPR just chose: 'classifier' (this
+// incident's own events matched a pattern) or 'oracle' (they did not, and this is
+// the latest unrelated category seen for the same system_id).
+//
+// WHY THIS EXISTS (Phase 4 review, HIGH finding): the two sources are NOT
+// interchangeable, and storing only the category made that invisible. An oracle
+// category is TIME- AND RUN-UNCORRELATED — it is "the last non-unknown thing we
+// knew about this equipment", not a statement about THIS problem. Live, all 40
+// oracle-sourced incidents carry a category that appears NOWHERE in their own L0
+// events: "No new monitoring data found." was stamped `rsync_io_timeout`,
+// "missing host_ip" likewise, "File not present" became `host_unreachable`. The
+// Phase 4 assessor keyed severity on `category` and duly rated them as transport
+// faults and credential failures. "Advisory only" was documented here from the
+// start; nothing enforced it, so the first consumer consumed it as fact.
+//
+// This expression is the enforcement point: the assessor reads the provenance and
+// refuses to treat an oracle category as evidence (domain/assessor/rules.js).
+//
+// DERIVED FROM THE JOIN, NOT FROM error_type: the interim detector the review
+// suggested (`category <> 'unknown' AND error_type = ''`) is exact today only
+// because classify returns error_type '' for exactly the unknown case — and
+// populating error_type on corroborated rows is an ALREADY-TRACKED Phase 3
+// follow-up. The day someone lands it, that detector silently stops matching and
+// the HIGH bug returns with no test failing. Keying on the join that actually
+// made the decision cannot rot that way.
+const CATEGORY_SOURCE_EXPR = `
+    CASE
+      WHEN rep.error_category = 'unknown' AND se.enr_category IS NOT NULL
+        THEN 'oracle'
+      ELSE 'classifier'
+    END`;
+
+module.exports = { SYS_ENRICH_CTE, FINAL_CATEGORY_EXPR, CATEGORY_SOURCE_EXPR };
