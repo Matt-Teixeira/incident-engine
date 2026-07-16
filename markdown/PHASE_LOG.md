@@ -187,7 +187,8 @@ truth, not corrected here (noted for Phase 5 auto-close timing).
   `uq_incidents_fingerprint_entity`.
 - Deployment: no new deploy surface (same batch one-shot). Superuser step this phase:
   re-apply `db/schema.sql` (adds + backfills `error_events.entity`) **before** running the
-  new `assess`. Cron cadence still open.
+  new `assess`. Cron cadence **decided + installed after this phase** (2026-07-16): a single
+  `run` line at `25,55` — see `markdown/DEPLOYMENT.md` "Cadence".
 
 ## Validation
 
@@ -353,7 +354,11 @@ Re-validation after fixes (all green):
   deliberate cross-cutting phase, not an aggregate-only patch.
 - Optional (re-review, exact sample-message parity): persist the computed `eventText` on
   `error_events` and read it directly instead of reconstructing `msg` in SQL.
-- Open decisions unchanged: cron cadence, acquisition-v2 onboarding, self-ingestion, retention.
+- **Cron cadence: DECIDED + installed 2026-07-16** (post-commit) — one `run` line at
+  `25,55`; rationale + the exact line in `markdown/DEPLOYMENT.md` "Cadence". Verified by
+  running the exact cron command string from a foreign cwd (exit 0); a full-day incremental
+  run then held the exactly-once invariant (228,490 L0 rows → 504 incidents, delta 0).
+- Open decisions unchanged: acquisition-v2 onboarding, self-ingestion, retention.
 
 ## Commit Readiness
 

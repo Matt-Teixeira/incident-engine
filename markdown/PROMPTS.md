@@ -43,6 +43,10 @@ Later, read-only insight moves to the operator surface: a **dashboard incidents 
 - reads `warn_error_logs` **only** (never detoasts `verbose_log`); every job is
   **idempotent** (watermark + `ON CONFLICT`)
 - deployed as a **cron-batch one-shot**, not a long-running service
+- **job cadence (decided 2026-07-16):** a single `run` cron line (materialize→assess) at
+  **`25,55`** — half-hourly, just after the producers' bursts finish (~:21/:51). Two
+  staggered lines were rejected: `materialize` and the `assess` aggregate serialize on a
+  shared watermark lock, so they cannot run concurrently anyway. See `DEPLOYMENT.md`.
 
 ## Not decided yet
 
@@ -52,7 +56,6 @@ Later, read-only insight moves to the operator surface: a **dashboard incidents 
   this is decided (see `notes/phase_2_reevaluation.md`)
 - whether incident-engine ever **ingests its own** self-logged errors (self-monitoring);
   excluded from the scan for now to avoid a feedback loop
-- job cadence: one `run` cron line (materialize→assess) vs. two staggered lines
 - `incidents.error_events` retention (BRIN + full history now; revisit detach/partitioning
   only if volume demands)
 - whether the dashboard incidents view drills into `incidents.error_events` or only

@@ -45,9 +45,38 @@ Invocation (host, in the app dir):
 docker compose run --rm app node index.js run
 ```
 
-Cadence is a cron line calling `run` (or two staggered lines for `materialize` / `assess`)
-— decided in Phase 1. The app runs as `user: "105:987"` on the external `pg_net` network,
-with `node_modules` bind-mounted from `/opt/resources/node_mod_cache/incident-engine`.
+The app runs as `user: "105:987"` on the external `pg_net` network, with `node_modules`
+bind-mounted from `/opt/resources/node_mod_cache/incident-engine`.
+
+## Cadence (decided 2026-07-16, after Phase 3)
+
+**One** cron line calling `run`, half-hourly at **:25/:55** — installed in the host crontab:
+
+```cron
+25,55 * * * * cd /opt/apps/incident-engine && docker compose run --rm app node index.js run
+```
+
+Why one line, not two staggered ones: `materialize` and the `assess` aggregate **serialize on
+a shared watermark row lock** (`pipeline_state['util.app_run_logs']` — see
+`jobs/aggregate/index.js`), so they can never run concurrently by construction. Two lines
+would only block each other while doubling the self-log rows, exit codes to monitor, and
+failure modes. A single sequential `run` also guarantees the aggregate sees the freshest L0
+and never waits on the lock at all.
+
+Why :25/:55: the producers are all half-hourly and write in two bursts —
+`data_acquisition` at `00,30` (+ staggered `10,40`/`16,46`/`17,47`/`58,28`) and
+`hhm_rpp_ge`/`hhm_rpp_philips` at `15,45` (5–50s sleep stagger). Live, the bursts finish by
+~:21 and ~:51, so :25/:55 runs just after each one and never piles onto the producers' DB
+load. Steady-state a `run` is ~4–7s (~116ms when the window is empty). Trade-off: the small
+`58,28` stragglers wait until the next run (~27 min).
+
+The `cd` prefix is required — cron runs from `$HOME`, and `docker compose` without it fails
+with "no configuration file provided". Match the suite's existing lines.
+
+Output is not redirected (matching the rest of the suite), so run output lands in the cron
+mail spool; the app's real observability is its self-log row in `util.app_run_logs`
+(`app_name = 'incident-engine'`) and the per-run JSON in `/opt/run-logs/incident-engine/`.
+A non-zero exit means the batch failed (see the exit-code rule in `PHASE_LOG.md` Phase 1).
 
 ## Smoke test (after a job/schema/role change)
 
