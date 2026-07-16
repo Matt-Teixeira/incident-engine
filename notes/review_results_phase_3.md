@@ -168,7 +168,7 @@ and note #2 (#4 left as-is).
 |---|-----|---------|--------|
 | 1 | Low | `db/schema.sql` entity backfill used `btrim` (spaces-only) vs `entity()`'s JS `.trim()` (all whitespace) → split at the 16-char sme cap boundary for a trailing non-space whitespace char (pathological; sme ≤8 live). | **Fixed** |
 | 2 | Low | ON CONFLICT `category` refresh (newest wins) can regress a confident category to `unknown` — safe only under the empirical single-category-per-fingerprint invariant. | **Noted** in code |
-| 3 | Low | Oracle-corroborated `category` leaves `error_type = ''` (34+ live incidents) — the oracle has no type and its category is a different vocabulary, so no reliable derivation. | **Documented** |
+| 3 | Low | Oracle-corroborated `category` leaves `error_type = ''` (~39 live incidents). | **Documented** (see the correction below) |
 | 4 | Low | `msg` (jsonb extraction) computed in the `batch` CTE for every row though only the representative's is used (mitigated by COALESCE short-circuit). | Left as-is |
 
 Fixes applied:
@@ -177,9 +177,30 @@ Fixes applied:
   `.trim()`. Re-verified live: `entity` == the corrected expression for all 203,596 rows
   (0 mismatches).
 - **F3**: documented in `enrichment.js`, the aggregate INSERT, and `docs/incidents-schema.md`
-  that only `category` is corroborated (oracle vocabulary), `error_type`/`phase` stay the
-  deterministic classifier's output; `error_type=''` on a corroborated incident means "type
-  undetermined", not a stale pairing.
+  that only `category` is corroborated; `error_type`/`phase` stay the deterministic
+  classifier's output, so `error_type=''` on a corroborated incident means "type not looked
+  up", not a stale pairing.
+
+**CORRECTION (2026-07-16, post-commit — the round-3 F3 rationale was wrong).** The review
+asserted that a corroborated category is "in the oracle's vocabulary, NOT our classifier's
+taxonomy, so no reliable category→type map exists". **That is false**, and it was asserted
+from the name `rsync_io_timeout` looking unfamiliar rather than from checking the table.
+Verified: `rsync_io_timeout` IS one of our classifier's 19 categories, and the oracle's 9
+distinct live `error_category` values are a **subset** of our vocabulary (+ `unknown`) —
+`stats.acquisition_history` is written by `data_acquisition` using the same
+`connection_regex.js` this app copied verbatim. Consequences:
+
+- The **behaviour is unchanged and still correct** (`error_type=''` on corroborated rows);
+  only the stated *reason* was wrong. Docs corrected in `enrichment.js`,
+  `utils/db/queries/incidents.js`, and `docs/incidents-schema.md`.
+- Deriving `error_type` from a corroborated category IS possible (the classifier table is a
+  category→type map) — it was dismissed on a false premise. Now a tracked follow-up rather
+  than an impossibility; it matters to Phase 4, whose rules key off category/error_type.
+
+Method note: this is the third defect in this phase that only surfaced on checking reality
+(the transaction-start cursor race, the backtick-in-template-literal, the missing cron `cd`).
+Assertions about the data/taxonomy must be verified against the live DB or the source table,
+not inferred — the FLOW Step-2 rule exists for exactly this.
 - **F2**: a NOTE at the category-refresh guard records the single-category reliance and what
   to do if a future taxonomy ever makes a fingerprint mixed-category.
 

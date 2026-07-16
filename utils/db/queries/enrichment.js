@@ -14,14 +14,20 @@
 //     classifier returned 'unknown'. classify stays primary; enrichment is
 //     advisory and never overwrites a confident category or writes a NULL over
 //     a value (Determinism Rule).
-//   - Only `category` is corroborated. `error_type` is NOT: the oracle carries
-//     no type column, and a corroborated `category` is in the ORACLE's
-//     vocabulary (e.g. 'rsync_io_timeout'), which is NOT our classifier's
-//     taxonomy, so no reliable category→type map exists. A corroborated incident
-//     therefore keeps error_type = '' (the 'unknown' classify's value) — read as
-//     "category known via the oracle, type undetermined", NOT a stale/wrong
-//     pairing (re-review, low finding). `phase` is likewise left '' (not
-//     corroborated). Both stay the deterministic classifier's output.
+//   - Only `category` is corroborated. `error_type` is NOT: the oracle carries no
+//     type column, and the aggregate has no category→type lookup in SQL, so a
+//     corroborated incident keeps error_type = '' (the 'unknown' classify's
+//     value) — read as "category known via the oracle, type not looked up".
+//     `phase` is likewise left '' (not corroborated).
+//     VOCABULARY (verified 2026-07-16): the oracle's error_category values ARE
+//     our classifier's vocabulary — stats.acquisition_history is written by
+//     data_acquisition using the same connection_regex.js this app copied
+//     verbatim, and its 9 distinct live values are a subset of our 19 (+
+//     'unknown'). So a corroborated category IS a valid classifier category, and
+//     deriving its error_type from the classifier table is POSSIBLE — it is
+//     simply not done here. (An earlier comment claimed the vocabularies differ
+//     and that derivation was impossible; that was wrong. Populating error_type
+//     for corroborated rows is a tracked follow-up — see PHASE_LOG Phase 3.)
 //
 // Richer, time-correlated use of this oracle (the recovery/auto-close signal)
 // is Phase 5, not here.

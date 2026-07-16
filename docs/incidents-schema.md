@@ -51,8 +51,8 @@ One row per `warn_error_logs` event, fingerprinted + classified at materialize t
 | `systems` | TEXT[] | affected `system_id`s (union); empty for `__global__` incidents |
 | `sample_run_id` | UUID | representative event (most recent by `dt` in the batch) |
 | `sample_message` | TEXT | representative message (human-readable `eventText` chain, not the normalized hash input) |
-| `category` | VARCHAR(64) | the representative event's `error_category`; when that is `unknown` it may be **corroborated** from the oracle (then in the oracle's vocabulary, e.g. `rsync_io_timeout` — see enrichment) |
-| `error_type` | VARCHAR(16) | the classifier's `error_type` only — **not** corroborated (the oracle has no type). `''` when the category was oracle-corroborated (type undetermined), not a stale pairing |
+| `category` | VARCHAR(64) | the representative event's `error_category`; when that is `unknown` it may be **corroborated** from the oracle. Same vocabulary either way — the oracle's values are a subset of this app's classifier taxonomy (both trace to `connection_regex.js`), so `category` is always a valid classifier category |
+| `error_type` | VARCHAR(16) | the classifier's `error_type` only — **not** corroborated (the oracle has no type column and the aggregate does no category→type lookup). `''` on the ~39 oracle-corroborated rows; deriving it from the corroborated category is possible and is a tracked follow-up |
 | `phase` | VARCHAR(32) | `''` in Phase 3 (not enriched; per-run, uncorrelatable without a `run_id` join) |
 | `func` | VARCHAR(64) | |
 | `severity` | VARCHAR(16) | assessor: critical/high/medium/low/info |

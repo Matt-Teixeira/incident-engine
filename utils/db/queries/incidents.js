@@ -143,8 +143,8 @@ SELECT
   e.run_id, e.msg,
   e.final_category,         -- may be oracle-corroborated (enrichment.js)
   e.error_type,             -- classifier's only; NOT corroborated ('' when the
-                            -- category was corroborated from the oracle — the
-                            -- oracle has no type; see enrichment.js)
+                            -- category was corroborated — no category→type
+                            -- lookup here; see enrichment.js)
   '',                       -- phase: not enriched in Phase 3 (see enrichment.js)
   e.func
 FROM agg a

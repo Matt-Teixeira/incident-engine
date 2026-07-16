@@ -301,10 +301,15 @@ enrichment 1:1 join, and consistent ms-truncation all verified). 4 low; develope
   `.trim()` at the 16-char sme cap boundary (the R2 whitespace gap, not applied to the
   backfill). Fixed: `btrim(sme, E' \t\n\r\f\v')` / `btrim(system_id, …)`; re-verified 0
   entity mismatches over all 203,596 live rows.
-- **#3 (low)** — an oracle-corroborated `category` left `error_type=''` (34+ live incidents).
-  Documented (not a stale pairing): only `category` is corroborated, from the oracle's
-  vocabulary; `error_type`/`phase` stay the deterministic classifier's output; `''` = type
-  undetermined. `enrichment.js` + aggregate INSERT + `docs/incidents-schema.md` updated.
+- **#3 (low)** — an oracle-corroborated `category` left `error_type=''` (~39 live incidents).
+  Documented (not a stale pairing): only `category` is corroborated; `error_type`/`phase`
+  stay the deterministic classifier's output. **The rationale was later CORRECTED
+  (2026-07-16)**: the review claimed the oracle used a different vocabulary so no
+  category→type derivation was possible — false. The oracle's 9 live `error_category` values
+  are a subset of our classifier's 19 (both trace to `connection_regex.js`, which
+  `data_acquisition` owns and this app copied verbatim). Behaviour unchanged and still
+  correct; only the stated reason was wrong. Docs fixed; the derivation is now a tracked
+  follow-up (see below). See `notes/review_results_phase_3.md` §CORRECTION.
 - **#2 (low)** — noted in code that the newest-wins `category` refresh could regress a
   confident category to `unknown` if a fingerprint ever became mixed-category (empirically
   never; single-category live). **#4** (msg computed per batch row) left as-is.
@@ -354,6 +359,12 @@ Re-validation after fixes (all green):
   deliberate cross-cutting phase, not an aggregate-only patch.
 - Optional (re-review, exact sample-message parity): persist the computed `eventText` on
   `error_events` and read it directly instead of reconstructing `msg` in SQL.
+- **Populate `error_type` on oracle-corroborated incidents** (~39 live rows currently `''`).
+  Now known to be feasible: the oracle's categories are our classifier's vocabulary, so
+  `connection_regex.js` IS a category→type map. Needs that map available to the SQL aggregate
+  (e.g. a VALUES CTE generated from the table at require-time, keeping `connection_regex.js`
+  the single source of truth). **Relevant to Phase 4** — a severity rules table keyed on
+  `error_type` would misfire on those rows today; keying on `category` avoids it.
 - **Cron cadence: DECIDED + installed 2026-07-16** (post-commit) — one `run` line at
   `25,55`; rationale + the exact line in `markdown/DEPLOYMENT.md` "Cadence". Verified by
   running the exact cron command string from a foreign cwd (exit 0); a full-day incremental
