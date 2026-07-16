@@ -1,5 +1,20 @@
 Phase 4 - Deterministic Assessor (L3)
 
+!! REVISED 2026-07-16 (FLOW Step 3, pre-implementation) - see
+!! notes/phase_4_reevaluation.md for the live evidence and the developer decisions.
+!! The phase's SHAPE is unchanged (pure assess(dossier), ASSESSOR_KIND seam, rules
+!! impl, no LLM, no state/auto-close). Four ORIGINAL rule clauses were wrong against
+!! what Phase 3 actually produced and are SUPERSEDED by the Scope below:
+!!   - "large systems[]" blast radius: DEAD - apps[]/systems[] are structurally <=1
+!!     (src_app_name is in the fingerprint; the entity IS the system). Real blast
+!!     radius = entities per fingerprint (top: 59), assembled into the dossier.
+!!   - "unknown -> medium" flat: would rate all 213 unknowns medium, 143 of them
+!!     known WARN pipeline-noise. Now type-split (see Scope).
+!!   - "manual_intervention" is NOT a category - it is a boolean flag on each
+!!     connection_regex.js entry. Now looked up by category from the taxonomy.
+!!   - the rules omitted rsync_io_timeout (187 incidents - the #2 category) and ~12
+!!     other taxonomy categories. Full coverage now required.
+
 Goal:
 Assess each incident deterministically - severity, category, recommended action, confidence,
 reasons - via a pure assess(dossier) function, behind a pluggable seam that a future LLM
@@ -12,36 +27,82 @@ Scope:
 - assess(dossier) -> { severity: critical|high|medium|low|info, category, recommendedAction?,
   confidence: 0..1, reasons: string[] }. PURE: no DB handle, no clock, no network inside.
   Make it async from day one so an LLM impl needs no signature change.
-- Rules table keyed off classify output + blast radius: credentials/host_key_changed/
-  manual_intervention -> high (needs human); host_unreachable/connection_timeout with large
-  systems[] -> high else medium; *_partial (successful_acquisition families) -> low/info;
-  'unknown' -> medium, confidence ~0.3, reason "unclassified - needs pattern". Every branch
-  pushes a reason. recommendedAction maps from category.
-- jobs/assess (assessment step): assemble a plain dossier per touched incident, call await
-  assess(dossier), write severity/confidence/assessment(JSONB reasons+action)/assessor_kind.
+- Dossier (assembled by the job, NOT read inside assess): category, type (WARN|ERROR),
+  occurrence_count, entity_count (distinct entities sharing this fingerprint - the real
+  blast radius), entity, func, first_seen/last_seen, sample_message. Keep it a plain object.
+- Rules table keyed off category + type + entity_count + occurrence_count:
+  * any category whose connection_regex.js entry has manual_intervention: true -> high
+    (needs a human). Look the flag up BY CATEGORY from the taxonomy - do not hand-list
+    categories; connection_regex.js stays the single source of truth.
+  * credentials / host_key_changed -> high (needs human).
+  * host_unreachable / connection_timeout / connection_reset / rsync_io_timeout: escalate on
+    blast radius - large entity_count -> high, else medium. Pick and JUSTIFY the threshold
+    from live data (entities-per-fingerprint runs 1..59); put it in a named constant.
+  * *_partial families (rsync_partial, file_missing_partial, permission_denied_partial) ->
+    low/info.
+  * unknown + WARN -> info, low confidence, reason "unclassified pipeline status".
+    unknown + ERROR -> medium, confidence ~0.3, reason "unclassified - needs pattern".
+  * COVER THE WHOLE TAXONOMY: all 19 classifier categories must resolve to a reasoned
+    severity (or a principled, documented default). Every branch pushes a reason.
+  * recommendedAction maps from category.
+- Severity is type-aware generally, not only for unknown (e.g. rsync_io_timeout is 160 ERROR
+  vs 27 WARN incidents) - justify the WARN treatment per family.
+- db/schema.sql: add `type VARCHAR(8)` to incidents.incidents (CREATE + an idempotent
+  Phase 4 UPGRADE section that backfills from incidents.error_events and converges an
+  existing DB - mirror the Phase 3 `entity` precedent). Lossless: type is inside the
+  fingerprint, so 0 fingerprints carry both types (verified live). Update
+  docs/incidents-schema.md to match. The Phase 3 aggregate must also start writing it.
+- jobs/assess (assessment step, AFTER the existing aggregate in the same job): select
+  incidents touched this run OR with severity IS NULL (so the existing ~504 backlog is
+  assessed on the first run), assemble a plain dossier per incident, call
+  await assess(dossier), write severity/confidence/assessment(JSONB reasons+action)/
+  assessor_kind.
 
 Non-goals:
 - NO LLM implementation (only the rules impl + the seam). The assessor must NOT set incident
   state or perform auto-close (that stays deterministic, Phase 5). No writes outside incidents.
+- Do not touch the frozen identity domain (normalize.js / fingerprint.js / the classifier
+  table) - FP_VERSION stays 1. Reading the taxonomy for flags is fine; changing it is not.
 
 Expected files / layers:
-- domain/assessor/{contract,rules,index}.js, jobs/assess/* (assessment step), test/
-  assessor-rules.test.js.
+- domain/assessor/{contract,rules,index}.js, jobs/assess/* (assessment step), db/schema.sql
+  (type column + UPGRADE), test/assessor-rules.test.js.
 
 Expected validation:
-- node --test: a dossier->result table covering every severity branch and the unknown path;
-  determinism (same dossier -> same result); assess is pure (no I/O).
-- Live smoke: after aggregate, run assess -> incidents get severity/confidence/assessment;
-  re-run -> stable results, assessor_kind='rules'.
+- node --test: a dossier->result table covering EVERY severity branch, both types, the
+  entity_count escalation boundary, and the unknown WARN/ERROR split; determinism (same
+  dossier -> same result); assess is pure (no I/O).
+- Live smoke: apply the schema, run assess -> the backlog gets severity/confidence/
+  assessment, assessor_kind='rules'; re-run -> stable results; verify the severity
+  DISTRIBUTION is sane (a ~70-incident medium queue, not ~213) and spot-check that the
+  WARN noise fingerprints landed at info.
+- Run the actual job and read the rows - unit tests cannot see the dossier assembly, the
+  write path, or the ASSESSOR_KIND selection (see the Phase 3 lesson below).
 
 Write-isolation / least-privilege / idempotency / determinism constraints:
 - assess is pure and deterministic; ASSESSOR_KIND seam present; no LLM in the critical path.
-- Writes only the assessment columns on incidents.incidents.
+- Writes only the assessment columns (+ the new type column via the aggregate) on
+  incidents.incidents. stats.acquisition_history SELECT-only. Never verbose_log.
+- Connect as incident_engine_rw, never a superuser. No new grant should be needed (the role
+  owns incidents) - verify.
+- Re-running assess must be stable (pure function over the same dossier).
 
 Schema assumptions to confirm live (Step 2):
-- None new (reads incidents.incidents produced in Phase 3).
+- The category x type mix HAS MOVED (the pipeline is cron-live at :25,:55). Re-measure
+  before fixing thresholds; the numbers in notes/phase_4_reevaluation.md are a 2026-07-16
+  snapshot, not a constant.
+- error_type is '' on ~39 oracle-corroborated incidents - a rules table keyed on error_type
+  MISFIRES there. Key on category. (See PHASE_LOG Phase 3 §Follow-Up/§CORRECTION.)
+- Confirm 0 fingerprints carry both types before relying on the type backfill.
 
 Review questions:
 - Is assess() genuinely pure (unit-testable with injected dossiers, no I/O)?
 - Does the seam let an LLM impl drop in behind the same async signature, advisory-only?
-- Is every branch reasoned and confidence-scored? Is 'unknown' handled safely?
+- Is every branch reasoned and confidence-scored? Does every one of the 19 categories
+  resolve? Is 'unknown' handled safely and is the WARN/ERROR split defensible?
+- Is the entity_count threshold justified from live data rather than guessed?
+- Does the severity distribution actually help an operator, or did we just relabel the
+  firehose?
+- Open (raise in the plan): rules are versioned only by assessor_kind. Should an
+  ASSESSOR_VERSION be stamped per row (mirroring FP_VERSION) so a rules change is
+  detectable and re-assessable? There is no column for it yet.
