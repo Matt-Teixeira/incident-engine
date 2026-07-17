@@ -5,6 +5,306 @@ Durable memory of what's been done and why. Newest entry at the top. Add an entr
 
 ---
 
+# Phase 5 — State Machine + Auto-Close (L5)
+
+Date:
+2026-07-17
+
+Status:
+Completed
+
+Prompt:
+`prompts/prompt_5_state_autoclose.txt` (revised 2026-07-16 pre-implementation, FLOW Step 3 —
+`notes/phase_5_reevaluation.md`; committed `77df163`)
+
+Git Commit:
+Pending
+
+Review Artifacts:
+
+- Codex handoff (round 1): `notes/codex_handoff_phase_5.md`
+- Review results (round 1): `notes/review_results_phase_5.md` (1 high, 2 medium — all real;
+  F1/F2 fixed and re-validated live, F3 repo-side done + infra step pending)
+- Codex handoff (fix round, delta): `notes/codex_handoff_phase_5_fixes.md`
+- Review results (rounds 2–3): `notes/review_results_phase_5.md` §round 2–3 — residual
+  evidence-pool provenance finding fixed and **verdicted closed; F1 closed, F2 closed,
+  no new findings**. F3 stays open pending the post-merge infra step (by design).
+- Step-3 re-evaluation (pre-implementation): `notes/phase_5_reevaluation.md`
+
+## Goals
+
+- Deterministic lifecycle on `incidents.incidents.state` (open / acknowledged / recurring /
+  resolved / suppressed), engine-driven only: backlog/new → open; auto-close on **recovery**
+  (oracle success after `last_seen`) or **staleness** (no recurrence in `STALE_AFTER_DAYS`);
+  re-open past-resolution recurrences as `recurring`.
+- **Non-goals (held):** no L4 (`action_*` never written), no notifications, no human UI, no
+  LLM, no flap hysteresis (flapping is made VISIBLE, not dampened), severity is not a state
+  input.
+
+## Built
+
+- `domain/state.js` — the pure transition function. **Deliberately SYNCHRONOUS** — the
+  inverse of `assess()`'s deliberate async: lifecycle stays deterministic forever, and a sync
+  signature refuses an async (I/O-doing) implementation structurally. No clock inside — the
+  job supplies the evaluation instant. Exports `STATE`, `ENGINE_STATES` (open/recurring/
+  resolved — the only values the engine may write), `RESOLVED_REASON`, `STALE_AFTER_DAYS=7`.
+- `utils/db/queries/recovery.js` — the oracle lookup (max successful
+  `COALESCE(capture_datetime, inserted_at)` per system, deliberately unbounded — a ~3k-cost
+  hash aggregate over ~97k rows once per run) + the all-incidents state-facts SELECT +
+  the update predicate. Registered in `test/sql-modules-load.test.js`.
+- `utils/db/sql/pg-helpers.js` — TWO state ColumnSets, split on purpose:
+  `incidents_state_only` (init + re-open; carries NO resolved_* column, so a re-open cannot
+  clear resolution history even if the job code regressed) and `incidents_resolution`
+  (state + resolved_at/reason/resolved_last_seen, atomically).
+- `jobs/assess/state.js` — the state step: ONE clock reading per run (post-connection
+  `clock_timestamp()` snapshot) used for every staleness comparison AND every `resolved_at`
+  stamped that run, so the stored timestamp is exactly the instant the decision was evaluated
+  against (the parity invariants depend on this equality). Evaluates ALL incidents from
+  durable facts; writes only transitions; no watermark (purity gives re-runnability).
+- `index.js` — `assess` job = aggregate → assessIncidents → **applyState** (order
+  load-bearing: state keys on the `last_seen` the aggregate just advanced; running last means
+  the lifecycle invariants hold at job-rest).
+- `db/schema.sql` — `resolved_last_seen TIMESTAMPTZ` (CREATE + idempotent UPGRADE; no
+  backfill needed — nothing was ever resolved before this column existed) + CHECK constraints
+  on `state` and `resolved_reason` (the round-2 M1 at-rest pattern, added unprompted;
+  negative-tested live: `state='closed'` and `resolved_reason='manual'` both rejected).
+- `integration/rep_determinism.js` — **the recorded Phase 4 landmine, discharged FIRST**
+  (before any state code existed): the TRUNCATE-and-restore design is retired for a
+  single-transaction + forced-ROLLBACK design. Nothing commits, so history-dependent state is
+  untouched by construction and a crash mid-test auto-rolls-back. No watermark manipulation
+  remains (rollback discards everything), so it takes no `pipeline_state` locks — no deadlock
+  surface against a concurrent aggregate; a cron tick mid-test blocks on the TRUNCATE's
+  ACCESS EXCLUSIVE lock for seconds instead of interleaving.
+- `integration/assess_parity.js` — the Phase 5 boundary move: `action_*`-only for the
+  never-written check, plus per-row LIFECYCLE INVARIANTS asserted from independent facts:
+  state non-NULL and engine-writable; open ⇒ no resolved_*; resolved ⇒ complete resolved_*,
+  reason in vocabulary, `last_seen ≤ resolved_last_seen`; recurring ⇒ prior-resolution
+  history AND `last_seen > resolved_last_seen`; `auto_recovery` ⇒ an oracle success after the
+  memento still exists (append-only); `stale` ⇒ `resolved_at - resolved_last_seen` > 7 days.
+- Tests: `test/state.test.js` (33 new; 147 total) — the full transition table incl. the
+  producer-clock-skew re-open case, strict boundaries, precedence, engine-states sweep.
+- Docs: `docs/incidents-schema.md` (state/resolved_at/resolved_reason/resolved_last_seen
+  rows), `markdown/PROMPTS.md`. Also backfilled the `Git Commit:` field on all five prior
+  PHASE_LOG entries (they all read "Pending"; the field exists to link record to code and
+  never did).
+
+## Schema Facts Confirmed (live DB)
+
+Step 2 re-measurement (2026-07-17; the re-evaluation's numbers were 2026-07-16):
+
+- 509 incidents (was 504 — cron-live). Oracle: 97,551 rows, `capture_datetime` **0 nulls**,
+  all five streams current. Day-one recovery set: **169**. Quiet recency: active 406 /
+  1–3d 50 / 3–7d 40 / >7d 13.
+- Recovery lookup plan: seq scan + hash aggregate, cost ~3.1k — trivial once per run.
+- Grants: `incident_engine_rw` has SELECT on `stats.acquisition_history` and UPDATE on the
+  new column; **no new grant needed** (proven by execution as the role, then explicitly).
+- **DEPLOYMENT-MODEL FACT (new, important):** `docker-compose.yaml` mounts `./:/workspace`
+  and the cron `cd`s into this directory — **the cron executes whatever is checked out in
+  the working tree**, committed or not. Phase 5 branch code went live at the first cron tick
+  after checkout, exactly as Phase 4's did during its development (unnoticed then). Recorded
+  in the handoff as a review question: acceptable dev-on-prod discipline, or does deploy need
+  pinning to a committed ref?
+
+## Important Decisions
+
+The load-bearing design decisions were made in the Step 3 re-evaluation (committed
+`77df163`, developer-approved): entity-keyed auto-close, `recurring` = re-opened-only,
+staleness close at 7 days, `capture_datetime` over `inserted_at`, the `resolved_last_seen`
+same-clock-domain re-open. Implementation-time decisions on top:
+
+### `nextState` is synchronous on purpose
+
+Decision: sync signature, tested to return a non-Promise.
+Reason: `assess()` is async so an advisory LLM can slot in; lifecycle is the opposite — no
+advisory implementation may ever drive state (Determinism Rule), and the sync signature makes
+that promise structural rather than conventional.
+Tradeoff: none foreseen; changing it would be a deliberate signal worth reviewing.
+
+### A NULL-state incident that is already closeable resolves in ONE evaluation
+
+Decision: initialization is defaulting (`NULL` treated as `open`), composed with the same
+run's close evaluation — the 169 day-one closes did not wait a cron cycle at `open`.
+Tradeoff: the backlog never observably passes through `open`; accepted, the state field is
+current reality, not a journal.
+
+### A resolved row WITHOUT its memento re-opens (fail-visible)
+
+Decision: `resolved_last_seen IS NULL` on a resolved row (predates Phase 5, or a foreign
+write) ⇒ `recurring`.
+Reason: an unverifiable close must not mask recurrences forever — the same direction as the
+assessor's provenance gate. Unreachable at rest today (nothing was resolved before Phase 5).
+
+### An unrecognized state string is left alone
+
+Decision: not clobbered, no transition; it surfaces in the run summary's counts.
+Reason: never overwrite a value we don't understand. Now ALSO impossible at rest (CHECK
+constraint), so this is pure-function defense in depth.
+
+### CHECK constraints on `state` and `resolved_reason` (unprompted hardening)
+
+Decision: vocabulary enforced at rest, mirroring the round-2 M1 pattern before a reviewer
+asks. A future human surface adding a state/reason must widen the constraint in a deliberate,
+logged phase — that friction is the point.
+
+## Architecture Notes
+
+- **Write-isolation / least-privilege:** state writes go through the two dedicated
+  ColumnSets (no severity/assessment/action_* columns to write); oracle SELECT-only; no new
+  grant. The engine can only produce open/recurring/resolved — pinned by `ENGINE_STATES`,
+  the unit sweep, the parity invariant, AND the DB CHECK.
+- **Idempotency:** no watermark; re-run writes 0 (proven). `resolved_at` stamped once per
+  transition, never refreshed (proven by the no-op re-run).
+- **Determinism:** transitions are a pure sync function of durable facts + one supplied
+  clock reading. Auto-close ordering compares producer-clock `capture_datetime` against
+  producer-clock `last_seen`; re-open compares producer-clock `last_seen` against the
+  producer-clock memento. No cross-domain comparison remains.
+- **Fingerprint/classifier:** untouched. `FP_VERSION` 1; assessor untouched (its parity
+  identity still holds bit-exact).
+- **Deployment:** no new deploy surface; superuser step = re-apply `db/schema.sql` (new
+  column + 2 constraints) before running this code. Plus the working-tree-is-live fact above.
+
+## Validation
+
+Commands run:
+
+```bash
+docker run --rm -v "$PWD":/w -w /w node:lts node --test              # 147/147 (33 new)
+docker exec -i pg_db psql -U postgres -d staging -f - < db/schema.sql # column + constraints; re-applied idempotently
+docker compose run --rm app node index.js assess                     # first state run
+docker compose run --rm app node index.js assess                     # re-run: 0 written
+docker compose run --rm app node index.js run                        # full cron path
+docker compose run --rm app node integration/rep_determinism.js      # reworked: PASS, rollback verified
+docker compose run --rm app node integration/assess_parity.js        # PASS incl. lifecycle invariants
+# constraint negative tests; grant checks; EXPLAIN of the recovery lookup
+```
+
+Results:
+
+- **147/147** unit. First state run: 509 evaluated / 509 written — **335 opened /
+  169 auto_recovery / 5 stale / 0 reopened**. The 169 matches the Step 2 day-one measurement
+  exactly; the 13 quiet->7d split 8 auto_recovery + 5 stale (precedence observed working).
+  The 5 stale closes are all genuinely 8–10 days quiet (`Delta is negative value`,
+  `datetime object null`, …). Re-run: **0 written**, all transition counts 0. Full `run`
+  exit 0; exactly-once delta 0 (Phase 3 invariant intact).
+- `rep_determinism.js` (reworked): comparison PASS AND rollback restored the table —
+  0 unassessed afterwards, parity green immediately after.
+- `assess_parity.js`: PASS across 509 incl. every lifecycle invariant; state distribution
+  335 open / 174 resolved.
+- Constraints negative-tested (`state='closed'`, `resolved_reason='manual'` → both
+  rejected); schema re-apply clean.
+- **Natural re-open OBSERVED LIVE, ~35 minutes after the first state run**: the producers'
+  next burst delivered new failure events for 4 previously-resolved incidents, and the state
+  step re-opened all 4 as `recurring` (`{"reopened":4}` in the run summary; distribution
+  335 open / 165+5 resolved / 4 recurring). Parity's lifecycle invariants PASS over them
+  (prior-resolution history kept; `last_seen > resolved_last_seen`). Re-open is therefore
+  verified against real data, not only the unit suite — and this is the flap set doing
+  exactly what the re-evaluation predicted (close→re-open cycles surfacing as `recurring`
+  rather than churning silently). These 4 will likely re-close on a future recovery — the
+  two-cycle rhythm is the §5.3 handoff question.
+
+## Review Notes
+
+Source:
+
+- `notes/review_results_phase_5.md` — pending; the developer runs the review from
+  `notes/codex_handoff_phase_5.md`.
+
+Critical issues:
+
+Verdict: 1 high, 2 medium — all three real (verified independently before fixing).
+
+- **F1 (high) — cross-producer recovery evidence.** Recovery grouped by system_id only, so
+  a data_acquisition (mmb) success closed hhm_rpp_* incidents on the same system: 30 false
+  closes live, and ALL FOUR of the "natural re-opens" this entry originally celebrated were
+  artifacts of those false closes flapping. Decisive fact (run_id join): every oracle
+  stream — including `philips`/`hhm` — is written by data_acquisition; the oracle is its
+  self-record. Root cause mine: the re-evaluation measured "reachable by producer" and read
+  reachability as coverage without asking WHOSE successes those were — the Phase 4 F1
+  family (identifier match treated as semantic evidence). FIXED: `ORACLE_SCOPED_APPS`
+  gate in the pure function (fail-safe on unknown src_app; re-open ignores scope), parity
+  scope invariants, and an idempotent remediation in db/schema.sql (UPDATE 30 → the fixed
+  engine re-decided: 29 open, 1 stale; incident 17157 honestly open).
+- **F2 (medium) — id-only state updates race their facts.** A row changed between read and
+  write (future human sets suppressed; concurrent aggregate advances last_seen) would be
+  overwritten by a decision made against old facts — disproving "suppressed is
+  engine-terminal" as stated. FIXED with the optimistic arm: prev_state/prev_last_seen/
+  prev_resolved_last_seen as cnd columns, `IS NOT DISTINCT FROM` matching, skipped rows
+  counted + WARN-logged, convergence next run. No locks held across JS compute.
+- **F3 (medium) — the working-tree cron (my §5.6 flag, now a finding).** FIXED repo-side:
+  `DEPLOYMENT.md` "Deploy boundary" section with the dedicated-worktree runbook
+  (`/opt/apps/incident-engine-deploy` pinned to reviewed refs; cron pointer moves; dev tree
+  keeps its mount). The one-time step needs root — **pending developer action**. Until
+  then: a `git checkout` here IS a production deploy.
+
+Post-fix validation: 153/153 unit (6 new scope tests incl. the 17157 regression verbatim);
+re-run 0 written / 0 skipped; parity + lifecycle + scope invariants PASS; distribution
+**363 open / 141 resolved (135 auto_recovery + 6 stale) / 5 recurring** — every
+auto_recovery row is data_acquisition, and the 5 recurring are genuine data_acquisition
+flaps (the live re-open proof survives, now on valid closes). Full record:
+`notes/review_results_phase_5.md`; delta handoff for re-review:
+`notes/codex_handoff_phase_5_fixes.md`.
+
+Round 2 (re-review): F2 closed; F1 partially — one residual medium, FIXED: `RECOVERY_SQL`
+scoped the consumer but not the evidence pool, so a future producer writing the oracle
+could falsely close data_acquisition incidents. Now a provenance semi-join admits only
+rows whose run_id links to a data_acquisition run (14-day-bounded, partition-pruned), with
+a fail-closed audit (`foreign_rows`/`unlinked_rows`, WARN when non-zero; live 0/0), parity
+provenance-verified evidence + a foreign-row failure assertion, and loader-guard landmarks
+pinning the semi-join. 156/156 unit; re-run 0. F3 not closed operationally — see below.
+
+Deferred findings:
+
+- **F3's root-requiring infra step (worktree + cron edit) — the single outstanding action
+  of this phase.** The runbook is written (`DEPLOYMENT.md` §Deploy boundary); the reviewer
+  correctly holds it open until `/opt/apps/incident-engine-deploy` exists and the cron
+  points at it. Developer action.
+
+## Problems Encountered
+
+- **Wrote SQL-style `--` comment lines inside a JS block comment** in the first cut of
+  `utils/db/queries/recovery.js` — invalid JavaScript, `require()` would have thrown.
+  Caught on immediate re-read, and it is EXACTLY the class `test/sql-modules-load.test.js`
+  exists for (the guard was run right after the fix: 13/13). The Phase 3/4 template-literal
+  backtick lesson, third variant.
+- A garbled self-comparison assertion in a new unit test (caught by the suite failing, fixed).
+
+## Follow-Up Tasks
+
+- Codex review of this phase (handoff ready); iterate; then commit.
+- **Watch the first natural re-open** (expected within cron cycles; the `recurring` count in
+  the state step's run summary + parity invariants will show it).
+- **The classification phase is NEXT** (queued, developer-ordered): classify the confirmed
+  hard-failure messages out of `unknown`; remove/update the interim-M2 reason string; bump
+  `RULES_VERSION`.
+- The `acknowledged`/`suppressed` human surface (dashboard) remains future; adding any new
+  state/reason now requires a deliberate constraint widening (see Decisions).
+- Decide whether the working-tree-is-live cron model needs hardening (pin deploys to a
+  committed ref?) — surfaced this phase, not resolved.
+- Open decisions unchanged: acquisition-v2 onboarding, self-ingestion, retention.
+
+## Commit Readiness
+
+- Requirements implemented: yes — per the revised prompt (all five supersessions honored).
+- Write-isolation / least-privilege rules hold: yes — dedicated ColumnSets; oracle
+  SELECT-only; no new grant; proven live as `incident_engine_rw`.
+- Jobs idempotent: yes — re-run writes 0; `resolved_at` stamped once; no watermark by design.
+- Assessment/lifecycle deterministic (no LLM): yes — pure SYNC transition function; engine
+  can only write open/recurring/resolved (four independent enforcement layers).
+- Source queries warn_error_logs-only / partition-pruned: n/a this step (reads own table +
+  the BRIN-indexed oracle; EXPLAIN'd).
+- Schema assumptions confirmed live: yes (Step 2 re-measured; oracle facts verified).
+- Review findings addressed or deferred: **three rounds complete** — 1 high + 2 medium
+  (round 1), 1 residual medium (round 2), clean (round 3). F1/F2 + residual: fixed,
+  re-validated live, verdicted CLOSED. F3 (deploy worktree/cron): runbook written,
+  root-requiring infra step deliberately sequenced AFTER commit+merge so the worktree
+  lands on the reviewed ref — the phase's single open item, and it is operational, not
+  code.
+- Validation recorded: yes (incl. reviewer-verified: 0 foreign / 0 unlinked oracle rows,
+  0 unscoped auto_recovery, 156/156, parity across 509).
+- Ready to commit: **yes.**
+
+---
+
 # Phase 4 — Deterministic Assessor (L3)
 
 Date:
@@ -18,7 +318,7 @@ Prompt:
 Step 3 — `notes/phase_4_reevaluation.md`)
 
 Git Commit:
-Pending
+`f5d62ed`
 
 Review Artifacts:
 
@@ -531,7 +831,7 @@ Prompt:
 `prompts/prompt_3_aggregate_incidents.txt`
 
 Git Commit:
-Pending
+`444e33a`
 
 Review Artifacts:
 
@@ -921,7 +1221,7 @@ Prompt:
 `prompts/prompt_2_materialize.txt` (as revised by `notes/phase_2_reevaluation.md`)
 
 Git Commit:
-Pending
+`381c519`
 
 Review Artifacts:
 
@@ -1227,7 +1527,7 @@ Prompt:
 `prompts/prompt_1_app_skeleton_provision.txt`
 
 Git Commit:
-Pending
+`38d52a2`
 
 Review Artifacts:
 
@@ -1507,7 +1807,7 @@ Prompt:
 `prompts/prompt_0_workflow_scaffold.txt`
 
 Git Commit:
-Pending
+`2d2039f`
 
 Review Artifacts:
 

@@ -34,6 +34,7 @@ const SQL_MODULES = [
   "../utils/db/queries/materialize",
   "../utils/db/queries/assess",
   "../utils/db/queries/enrichment",
+  "../utils/db/queries/recovery",
 ];
 
 test("SQL modules load and export usable SQL", async (t) => {
@@ -89,6 +90,24 @@ test("the aggregate upsert is still structurally intact", async (t) => {
     assert.ok(!UPSERT_INCIDENTS_SQL.includes("${"), "an interpolation was not evaluated");
     assert.ok(!UPSERT_INCIDENTS_SQL.includes("undefined"), "an interpolation resolved to undefined");
     assert.ok(UPSERT_INCIDENTS_SQL.includes("sys_enrich AS"), "the enrichment CTE is missing");
+  });
+});
+
+test("the recovery lookup admits only provenance-linked evidence", async (t) => {
+  const { RECOVERY_SQL, ORACLE_PROVENANCE_AUDIT_SQL } = require("../utils/db/queries/recovery");
+
+  await t.test("the semi-join to data_acquisition runs is present (round-2 residual)", () => {
+    // Dropping this link silently reverts the oracle to accepting evidence
+    // from any future producer — the exact regression round 2 named.
+    assert.ok(RECOVERY_SQL.includes("l.app_name = 'data_acquisition'"), "provenance semi-join missing");
+    assert.ok(RECOVERY_SQL.includes("l.run_id = ah.run_id"), "run link missing");
+    // Data-Contract Rule: the app_run_logs scan must be time-bounded to prune.
+    assert.ok(RECOVERY_SQL.includes("l.inserted_at >"), "app_run_logs scan is unbounded");
+  });
+
+  await t.test("the audit query watches both anomaly shapes", () => {
+    assert.ok(ORACLE_PROVENANCE_AUDIT_SQL.includes("foreign_rows"));
+    assert.ok(ORACLE_PROVENANCE_AUDIT_SQL.includes("unlinked_rows"));
   });
 });
 

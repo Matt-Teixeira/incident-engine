@@ -124,9 +124,36 @@ CREATE TABLE IF NOT EXISTS incidents.incidents(
     -- indistinguishable from a current one.
     assessor_version SMALLINT,
     assessment JSONB,
-    state VARCHAR(16),
+    -- lifecycle (Phase 5): open / acknowledged / recurring / resolved /
+    -- suppressed. ENGINE-driven transitions only (domain/state.js);
+    -- acknowledged/suppressed are reserved for a future human action — the
+    -- engine defines but never sets them, and never transitions OUT of
+    -- suppressed. `recurring` has exactly one meaning: re-opened after a
+    -- resolution (an occurrence threshold would mark ~everything instantly —
+    -- see notes/phase_5_reevaluation.md).
+    -- CHECK (round-2 M1 pattern: vocabulary enforced AT REST, not by reviewer
+    -- vigilance). NULL passes the CHECK by SQL semantics — new rows from the
+    -- aggregate carry NULL state until the state step initializes them.
+    state VARCHAR(16)
+        CONSTRAINT chk_incidents_state
+        CHECK (state IN ('open', 'acknowledged', 'recurring', 'resolved', 'suppressed')),
+    -- when the engine resolved it (DB clock, the batch's evaluation snapshot;
+    -- stamped once per transition, never refreshed by re-runs)
     resolved_at TIMESTAMPTZ,
-    resolved_reason VARCHAR(32),
+    -- 'auto_recovery' (a successful acquisition AFTER the incident's last_seen)
+    -- or 'stale' (no recurrence in STALE_AFTER_DAYS). Recovery is evaluated
+    -- first, so an incident eligible for both records the stronger reason.
+    resolved_reason VARCHAR(32)
+        CONSTRAINT chk_incidents_resolved_reason
+        CHECK (resolved_reason IN ('auto_recovery', 'stale')),
+    -- the incident's last_seen AT RESOLVE TIME (Phase 5). Re-open compares
+    -- last_seen > resolved_last_seen — BOTH producer-clock values. Comparing
+    -- last_seen against resolved_at (DB clock) instead would let a producer
+    -- whose clock trails the DB advance last_seen without ever exceeding
+    -- resolved_at, leaving the incident resolved WHILE FAILING — the exact
+    -- masking re-open exists to prevent. Kept (not cleared) on re-open as
+    -- history of the last resolution.
+    resolved_last_seen TIMESTAMPTZ,
     -- action_state / action_ref are reserved for future L4 auto-remediation;
     -- never written this increment.
     action_state VARCHAR(16),
@@ -294,6 +321,66 @@ BEGIN
     ALTER TABLE incidents.incidents
       ADD CONSTRAINT chk_incidents_category_source
       CHECK (category_source IN ('classifier', 'oracle'));
+  END IF;
+END $$;
+
+-- Phase 5: the re-open memento. Additive + nullable, so ADD COLUMN IF NOT
+-- EXISTS is metadata-only and re-apply is a no-op. NO backfill is needed or
+-- possible: no incident was ever resolved before this column existed (state was
+-- NULL on every row until Phase 5's first run), so there is no historical
+-- resolution to record. See the CREATE above for why this column exists
+-- (producer-clock re-open comparison; review-identified skew hazard).
+ALTER TABLE incidents.incidents ADD COLUMN IF NOT EXISTS resolved_last_seen TIMESTAMPTZ;
+
+-- Phase 5: vocabulary constraints on the lifecycle columns (the round-2 M1
+-- pattern — a typo'd state or reason is a writer bug that must be impossible at
+-- rest, not a value the transition function has to guess about; the engine-side
+-- guard is domain/state.js ENGINE_STATES + the state ColumnSets). Guarded DO
+-- blocks because ADD CONSTRAINT has no IF NOT EXISTS; fresh installs already
+-- carry both from the CREATE above (same names, so the guards skip).
+-- NOTE for the future human surface: a new resolved_reason (e.g. a manual
+-- close) or state value requires widening these constraints in a deliberate,
+-- logged phase — that friction is the point.
+-- Phase 5 (review, HIGH — remediation): the first cut admitted CROSS-PRODUCER
+-- recovery evidence — a data_acquisition (mmb/ip_reset) success closed
+-- hhm_rpp_ge/hhm_rpp_philips incidents on the same system, though the oracle
+-- records data_acquisition's own outcomes only (proven: every
+-- acquisition_history.run_id joins to a data_acquisition run). 30 incidents
+-- were falsely resolved (and 4 of them re-opened as artificial 'recurring'
+-- flaps). Reset the LIFECYCLE of every close whose evidence is inadmissible
+-- under the scope rule (domain/state.js ORACLE_SCOPED_APPS): the next state
+-- run re-decides them from scratch under valid rules (open, or a legitimate
+-- staleness close). IDEMPOTENT: matched rows get resolved_reason=NULL, so a
+-- re-apply matches nothing; the fixed engine can never re-create the state
+-- this predicate matches (auto_recovery requires apps[1]='data_acquisition'
+-- from then on). Assessment columns are untouched.
+UPDATE incidents.incidents
+   SET state = NULL,
+       resolved_at = NULL,
+       resolved_reason = NULL,
+       resolved_last_seen = NULL
+ WHERE resolved_reason = 'auto_recovery'
+   AND NOT ('data_acquisition' = ANY(apps));
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'chk_incidents_state'
+      AND conrelid = 'incidents.incidents'::regclass
+  ) THEN
+    ALTER TABLE incidents.incidents
+      ADD CONSTRAINT chk_incidents_state
+      CHECK (state IN ('open', 'acknowledged', 'recurring', 'resolved', 'suppressed'));
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'chk_incidents_resolved_reason'
+      AND conrelid = 'incidents.incidents'::regclass
+  ) THEN
+    ALTER TABLE incidents.incidents
+      ADD CONSTRAINT chk_incidents_resolved_reason
+      CHECK (resolved_reason IN ('auto_recovery', 'stale'));
   END IF;
 END $$;
 

@@ -40,19 +40,26 @@ const aggregate = require("./jobs/aggregate");
 // assessment (see jobs/assess). Phase 4.
 const assessIncidents = require("./jobs/assess");
 
-// The `assess` job: aggregate (L1/L2) then assess (L3), in that order.
+// L5: deterministic lifecycle — backlog init, auto-close (recovery/staleness),
+// re-open (see jobs/assess/state.js + domain/state.js). Phase 5.
+const applyState = require("./jobs/assess/state");
+
+// The `assess` job: aggregate (L1/L2) → assess (L3) → state (L5), in that order.
 //
-// ORDER IS LOAD-BEARING, not stylistic: the assessor's blast radius is a count
-// of the entities sharing a fingerprint, so it must run AFTER the aggregate has
-// inserted this batch's new incidents — otherwise a fingerprint that just went
-// fleet-wide would be assessed against last run's narrower radius and only catch
-// up on the following run.
-//
-// Auto-close / lifecycle `state` is Phase 5 and lands after this. The assessor
-// deliberately does NOT set state (Determinism Rule).
+// ORDER IS LOAD-BEARING, not stylistic:
+//   - assess after aggregate: blast radius is a count of the entities sharing a
+//     fingerprint, so it must see this batch's new incidents.
+//   - state LAST: its transitions key on last_seen, which the aggregate just
+//     advanced — evaluating before the aggregate would auto-close/re-open
+//     against the previous run's reality. Running last also means the
+//     lifecycle invariants (e.g. resolved ⇒ last_seen ≤ resolved_last_seen)
+//     hold at job-rest, which integration/assess_parity.js checks.
+// The assessor never sets state; the state step never touches severity — each
+// has its own ColumnSet with no column for the other's output.
 const assess = async (run_log) => {
   await aggregate(run_log);
   await assessIncidents(run_log);
+  await applyState(run_log);
 };
 
 async function runJob(run_log, job) {

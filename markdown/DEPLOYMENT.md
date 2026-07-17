@@ -100,6 +100,31 @@ Verify against the DB (as a superuser or the role):
 - the self-log identity is DB-enforced:
   `INSERT INTO util.incident_engine_self_log(app_name, ...) VALUES ('data_acquisition', ...);  -- expect: check option violation`
 
+## ⚠ Deploy boundary (Phase 5 review, medium — INFRA STEP PENDING)
+
+**The cron currently executes the mutable working tree.** `docker-compose.yaml` mounts
+`./:/workspace` and the cron line `cd`s into this directory — so a `git checkout`, or
+half-saved uncommitted edits, are LIVE at the next :25/:55 tick with no deploy boundary.
+Both Phase 4 and Phase 5 branch code ran in production before review this way.
+
+Decided fix (pending the infra step, which needs root): run cron from a **dedicated
+deployment worktree** that only ever points at a reviewed, committed ref:
+
+```bash
+# one-time (root or a user with /opt/apps write):
+git -C /opt/apps/incident-engine worktree add /opt/apps/incident-engine-deploy main
+cp /opt/apps/incident-engine/.env /opt/apps/incident-engine-deploy/.env   # gitignored, copied not linked
+# edit the cron line to: cd /opt/apps/incident-engine-deploy && docker compose run --rm app node index.js run
+
+# per deploy (after a phase is reviewed, committed, and merged):
+git -C /opt/apps/incident-engine-deploy fetch origin && git -C /opt/apps/incident-engine-deploy checkout <reviewed-sha>
+# then re-apply db/schema.sql if the phase changed it, and smoke per this runbook
+```
+
+The dev tree keeps its mount (that's what makes `docker compose run` smoke tests work);
+only the CRON pointer moves. Until the infra step happens, treat `git checkout` in this
+directory as a production deploy — because it is.
+
 ## Rollback
 
 Batch jobs are stateless between runs (state lives in `incidents.*` + the watermark).

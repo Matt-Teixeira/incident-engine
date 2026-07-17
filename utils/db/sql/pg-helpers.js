@@ -143,6 +143,61 @@ const pg_column_sets = {
             ],
             { table: pg_tables.incidents.incidents }
         ),
+        // The Phase 5 state step's TWO write surfaces — split on purpose:
+        //
+        //   incidents_state_only    — initialization (NULL → open) and re-open
+        //                             (resolved → recurring). Carries NO
+        //                             resolved_* column, so a re-open CANNOT
+        //                             clear the last resolution's history even
+        //                             if the job code regressed (the prompt
+        //                             requires resolved_* kept on re-open).
+        //   incidents_resolution    — the resolve transition: state +
+        //                             resolved_at/resolved_reason/
+        //                             resolved_last_seen together, atomically.
+        //
+        // Neither carries `severity`/`assessment` (the assessor's surface) nor
+        // `action_*` (reserved L4) nor `acknowledged`/`suppressed`-only fields —
+        // and the state VALUES the engine may write are additionally pinned by
+        // domain/state.js ENGINE_STATES + the unit suite. Same enforcement
+        // pattern as incidents_assessment above: the ColumnSet is the guard,
+        // not reviewer vigilance.
+        // Both state ColumnSets carry prev_* CONDITION columns (cnd: never SET,
+        // only matched in the WHERE): the optimistic guard from the Phase 5
+        // review (medium) — the update applies only if the row still holds the
+        // state/last_seen/resolved_last_seen the transition was computed from.
+        // A concurrently-changed row (future human sets suppressed; an
+        // overlapping aggregate advances last_seen) is skipped, surfaced in the
+        // run summary, and re-evaluated next run against its new facts.
+        incidents_state_only: new pgp.helpers.ColumnSet(
+            [
+                { name: 'id', cnd: true, cast: 'bigint' },
+                { name: 'prev_state', cnd: true, cast: 'varchar' },
+                { name: 'prev_last_seen', cnd: true, cast: 'timestamptz' },
+                { name: 'prev_resolved_last_seen', cnd: true, cast: 'timestamptz' },
+                { name: 'state', cast: 'varchar' },
+                { name: 'updated_at', mod: '^', cast: 'timestamptz' },
+            ],
+            { table: pg_tables.incidents.incidents }
+        ),
+        incidents_resolution: new pgp.helpers.ColumnSet(
+            [
+                { name: 'id', cnd: true, cast: 'bigint' },
+                { name: 'prev_state', cnd: true, cast: 'varchar' },
+                { name: 'prev_last_seen', cnd: true, cast: 'timestamptz' },
+                { name: 'prev_resolved_last_seen', cnd: true, cast: 'timestamptz' },
+                { name: 'state', cast: 'varchar' },
+                // the batch's evaluation snapshot (one clock reading per run,
+                // passed as a value) — NOT per-row clock_timestamp(), so
+                // resolved_at equals the eval_time the staleness comparison
+                // used and the parity invariant (resolved_at - resolved_last_seen
+                // > STALE_AFTER_DAYS for 'stale' rows) holds exactly.
+                { name: 'resolved_at', cast: 'timestamptz' },
+                { name: 'resolved_reason', cast: 'varchar' },
+                { name: 'resolved_last_seen', cast: 'timestamptz' },
+                { name: 'updated_at', mod: '^', cast: 'timestamptz' },
+            ],
+            { table: pg_tables.incidents.incidents }
+        ),
     },
 };
 

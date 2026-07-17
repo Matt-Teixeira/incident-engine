@@ -76,6 +76,32 @@ SELECT
   (SELECT min(e.type)
      FROM incidents.error_events e
     WHERE e.fingerprint = i.fingerprint) AS l0_type,
+  -- lifecycle (Phase 5) — the boundary moved: state is now ENGINE-WRITTEN and
+  -- checked against invariants below; only action_* remain never-written.
+  i.apps[1] AS src_app,
+  i.state,
+  i.resolved_at,
+  i.resolved_reason,
+  i.resolved_last_seen,
+  -- INDEPENDENT recovery evidence: for an 'auto_recovery' close, the oracle is
+  -- append-only, so the success that justified it must still exist — a success
+  -- strictly after the producer-clock memento, AND (round 2) provably
+  -- data_acquisition's own: its run must link to a data_acquisition run log.
+  -- The OR arm covers honest aging: an evidence row older than the OLDEST run
+  -- log cannot be expected to link (retention purged its run) — but a row
+  -- YOUNGER than the retention floor with no data_acquisition link is
+  -- inadmissible, exactly the foreign-producer case round 2 named.
+  EXISTS (SELECT 1
+            FROM stats.acquisition_history ah
+           WHERE ah.system_id = i.entity
+             AND ah.successful_acquisition
+             AND COALESCE(ah.capture_datetime, ah.inserted_at) > i.resolved_last_seen
+             AND (EXISTS (SELECT 1 FROM util.app_run_logs l
+                          WHERE l.run_id = ah.run_id
+                            AND l.inserted_at > now() - interval '14 days'
+                            AND l.app_name = 'data_acquisition')
+                  OR ah.inserted_at < (SELECT min(l2.inserted_at) FROM util.app_run_logs l2))
+         ) AS recovery_evidence,
   -- PROVENANCE cross-check against L0: does the stored category actually appear
   -- in this incident's own events? Scoped to (fingerprint, entity) — the
   -- incident's FULL key — not fingerprint alone (review round 2, low): oracle
@@ -154,6 +180,71 @@ const main = async () => {
       failures.push(`id=${row.id}: oracle-sourced category '${row.category}' was assessed as '${res.category}', not unknown`);
     }
 
+    // ---- lifecycle invariants (Phase 5) -----------------------------------
+    // TIMING CAVEAT: these hold at JOB-REST (the state step runs last in the
+    // assess job). Don't run this test concurrently with a cron tick — the
+    // window between an aggregate advancing last_seen and the same job's state
+    // step re-evaluating is a legitimate transient.
+    const engineStates = ["open", "recurring", "resolved"];
+    if (row.state == null) {
+      failures.push(`id=${row.id}: state NULL — backlog initialization missed it`);
+    } else if (!engineStates.includes(row.state)) {
+      // acknowledged/suppressed are legal VOCABULARY but nothing can set them
+      // yet — seeing one means something other than the engine wrote state.
+      failures.push(`id=${row.id}: state '${row.state}' — not engine-writable, and no human surface exists yet`);
+    }
+    if (row.state === "open") {
+      if (row.resolved_at !== null || row.resolved_reason !== null || row.resolved_last_seen !== null) {
+        failures.push(`id=${row.id}: open but carries resolved_* (re-open lands on recurring, never open)`);
+      }
+    }
+    if (row.state === "resolved") {
+      if (row.resolved_at === null || row.resolved_reason === null || row.resolved_last_seen === null) {
+        failures.push(`id=${row.id}: resolved but resolved_* incomplete`);
+      } else {
+        if (!["auto_recovery", "stale"].includes(row.resolved_reason)) {
+          failures.push(`id=${row.id}: resolved_reason '${row.resolved_reason}' outside the vocabulary`);
+        }
+        if (new Date(row.last_seen).getTime() > new Date(row.resolved_last_seen).getTime()) {
+          failures.push(`id=${row.id}: resolved but last_seen > resolved_last_seen — recurrence not re-opened`);
+        }
+        if (row.resolved_reason === "auto_recovery" && !row.recovery_evidence) {
+          failures.push(`id=${row.id}: auto_recovery close with NO oracle success after the memento`);
+        }
+        // SCOPE provenance (review round 1, HIGH): the oracle is
+        // data_acquisition's self-record — an auto_recovery close on any other
+        // producer's incident is founded on inadmissible evidence, whatever
+        // the timestamps say. This is the check that would have caught the 30
+        // cross-producer closes.
+        if (row.resolved_reason === "auto_recovery" && row.src_app !== "data_acquisition") {
+          failures.push(
+            `id=${row.id}: auto_recovery on a ${row.src_app} incident — out-of-scope oracle evidence (the round-1 HIGH regression)`
+          );
+        }
+        if (
+          row.resolved_reason === "stale" &&
+          new Date(row.resolved_at).getTime() - new Date(row.resolved_last_seen).getTime() <=
+            7 * 24 * 60 * 60 * 1000
+        ) {
+          failures.push(`id=${row.id}: 'stale' close but resolved_at - resolved_last_seen <= 7 days`);
+        }
+      }
+    }
+    if (row.state === "recurring") {
+      if (row.resolved_reason === "auto_recovery" && row.src_app !== "data_acquisition") {
+        failures.push(
+          `id=${row.id}: recurring atop an out-of-scope auto_recovery close — an artificial flap (round-1 HIGH)`
+        );
+      }
+      // recurring means exactly: re-opened after a resolution — its history
+      // must exist and the recurrence must postdate the memento.
+      if (row.resolved_at === null || row.resolved_last_seen === null) {
+        failures.push(`id=${row.id}: recurring without a prior resolution's history`);
+      } else if (new Date(row.last_seen).getTime() <= new Date(row.resolved_last_seen).getTime()) {
+        failures.push(`id=${row.id}: recurring but last_seen <= resolved_last_seen — nothing recurred`);
+      }
+    }
+
     // ---- stored == recomputed ---------------------------------------------
     if (row.severity === null || row.assessment === null) {
       failures.push(`id=${row.id}: never assessed (severity=${row.severity})`);
@@ -175,23 +266,41 @@ const main = async () => {
     }
   }
 
-  // The Determinism Rule's hard boundary: the assessor must never set lifecycle
-  // state or auto-close (Phase 5 owns those). Asserted against live rows because
-  // the ColumnSet, not the pure function, is what enforces it.
+  // The Determinism Rule's boundary, as of Phase 5: `action_*` (reserved L4) is
+  // never written by anything; state IS engine-written now, so it is checked
+  // against the lifecycle invariants per row below, not against NULL.
   const leaks = await db.one(
     `SELECT count(*)::int AS n FROM incidents.incidents
-      WHERE state IS NOT NULL OR resolved_at IS NOT NULL OR resolved_reason IS NOT NULL
-         OR action_state IS NOT NULL OR action_ref IS NOT NULL`
+      WHERE action_state IS NOT NULL OR action_ref IS NOT NULL`
   );
+  // Round 2's fail-closed assertion: the moment ANY oracle row belongs to a
+  // producer other than data_acquisition, the scope contract needs deliberate
+  // review — fail here rather than silently excluding forever.
+  const foreign = await db.one(
+    `SELECT count(*)::int AS n
+       FROM stats.acquisition_history ah
+       JOIN util.app_run_logs l
+         ON l.run_id = ah.run_id AND l.inserted_at > now() - interval '14 days'
+      WHERE ah.inserted_at > now() - interval '14 days'
+        AND l.app_name <> 'data_acquisition'`
+  );
+  if (foreign.n > 0) {
+    failures.push(
+      `${foreign.n} oracle row(s) from a NON-data_acquisition producer — ORACLE_SCOPED_APPS and the recovery semi-join need deliberate review`
+    );
+  }
   if (leaks.n > 0) {
-    failures.push(`${leaks.n} incident(s) carry state/resolved_*/action_* — the assessor must never write these`);
+    failures.push(`${leaks.n} incident(s) carry action_* — reserved for L4, never written`);
   }
 
   console.log("assessor:", kind, "v" + version);
   console.log("incidents checked:", rows.length);
   console.log("severity distribution:", JSON.stringify(severity_counts));
   console.log("category provenance:  ", JSON.stringify(source_counts));
-  console.log("state/action leaks:", leaks.n);
+  const state_counts = {};
+  for (const row of rows) state_counts[row.state ?? "(null)"] = (state_counts[row.state ?? "(null)"] || 0) + 1;
+  console.log("state distribution:   ", JSON.stringify(state_counts));
+  console.log("action_* leaks:", leaks.n);
 
   if (failures.length > 0) {
     console.error(`\nFAIL — ${failures.length} mismatch(es):`);
