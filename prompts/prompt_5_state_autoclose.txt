@@ -1,52 +1,154 @@
 Phase 5 - State Machine + Auto-Close (L5)
 
+!! REVISED 2026-07-16 (FLOW Step 3, pre-implementation) - see
+!! notes/phase_5_reevaluation.md for the live evidence and the developer decisions.
+!! The phase's SHAPE is unchanged (pure domain/state.js transitions, oracle SELECT-only,
+!! engine-driven transitions only, re-open on post-resolve recurrence, acknowledged/
+!! suppressed defined-but-never-set, no L4/notifications/LLM). Five ORIGINAL clauses
+!! were wrong or missing against the live system and are SUPERSEDED by the Scope below:
+!!   - "resolvable systems[]": DEAD - systems[] is structurally <=1 (the entity IS the
+!!     system; empty for __global__). Auto-close joins the oracle on entity.
+!!   - the recurring trigger ("threshold or multi-run span"): would mark ~ALL incidents
+!!     recurring instantly (303/504 span >=9 days; everything recurs every cron cycle).
+!!     recurring now means exactly: re-opened after a resolution.
+!!   - the oracle can only ever speak to 60% of incidents (188 on entities it has never
+!!     recorded + 11 __global__). A second deterministic close was added:
+!!     resolved_reason='stale' (no recurrence in STALE_AFTER_DAYS, default 7).
+!!   - "capture_datetime vs inserted_at" is RESOLVED: capture_datetime (0 nulls across
+!!     89k rows; inserted_at mis-orders backfills by up to 76 days).
+!!   - re-open compared producer-clock last_seen against DB-clock resolved_at - producer
+!!     skew could leave an incident resolved WHILE FAILING. New column
+!!     resolved_last_seen makes re-open a same-clock-domain comparison.
+
 Goal:
 Give incidents a deterministic lifecycle and auto-resolve them when the underlying system
-recovers - using stats.acquisition_history.successful_acquisition as the recovery oracle -
-so the incident list reflects current reality without a human closing each one.
+recovers (stats.acquisition_history.successful_acquisition as the recovery oracle) or when
+the problem stops occurring (staleness) - so the incident list reflects current reality
+without a human closing each one.
 
 Scope:
-- State machine on incidents.incidents.state: open -> acknowledged -> recurring -> resolved
-  -> suppressed. Engine-driven transitions only:
-  - new (fingerprint, entity) -> open.
-  - re-occurrence while open/acknowledged -> bump occurrence_count/last_seen; cross a
-    recurrence threshold or multi-run span -> recurring.
-  - auto-close: for each open/recurring incident with resolvable systems[], if
-    stats.acquisition_history has successful_acquisition=true for one of those system_ids
-    with capture_datetime (or inserted_at) LATER than the incident's last_seen -> state=
-    resolved, resolved_at=now(), resolved_reason='auto_recovery'. Deterministic; no human/LLM.
-  - re-open: a resolved incident whose (fingerprint, entity) recurs AFTER resolved_at ->
-    open/recurring (prevents a stale auto-close from hiding a real recurrence).
-- acknowledged and suppressed are reserved for a future human/dashboard action - the engine
-  defines but never sets them this phase.
-- jobs/assess (state step): run after assessment; pure transition logic in domain/state.js
-  (given incident + recovery facts -> next state), DB I/O in the job.
+- State vocabulary on incidents.incidents.state: open / acknowledged / recurring /
+  resolved / suppressed. ENGINE-DRIVEN TRANSITIONS ONLY:
+  - initialization: a new (fingerprint, entity) -> open. The existing backlog (state IS
+    NULL, ~504 rows live) -> open on the first run (Phase 4 backlog precedent).
+  - ordinary re-occurrence while open/recurring: NO state change - occurrence_count/
+    last_seen already advance via the aggregate. (The original threshold/span ->
+    recurring trigger is superseded: it is crossed by ~everything instantly, and a state
+    everything has distinguishes nothing - the Phase 4 flat-medium lesson.)
+  - auto-close (recovery): for each open/recurring/acknowledged incident whose entity is a
+    system the oracle records: if stats.acquisition_history has successful_acquisition=true
+    for system_id = entity with capture_datetime LATER than the incident's last_seen ->
+    state=resolved, resolved_reason='auto_recovery'. capture_datetime, NOT inserted_at
+    (same producer-side clock domain as the event dt feeding last_seen; inserted_at lags
+    it by a median ~5min but up to 76 days on backfills, which would close incidents on
+    stale evidence). COALESCE(capture_datetime, inserted_at) only as the documented
+    fallback for the column's nominal nullability (0 nulls live).
+  - auto-close (staleness): any incident (open/recurring/acknowledged) with NO recurrence
+    in STALE_AFTER_DAYS -> state=resolved, resolved_reason='stale'. STALE_AFTER_DAYS is a
+    named constant, default 7 - above the live quiet-1-3d hump (77 incidents merely
+    between recurrences must not close) and at the source-retention horizon; re-justify
+    against live recency in Step 2. This is what lets the ~40% of incidents the oracle
+    cannot see (__global__ + oracle-absent entities - live: 188+11 of 504) ever resolve.
+    PRECEDENCE: recovery is evaluated first, staleness second, so an incident eligible
+    for both records the stronger reason.
+  - on ANY resolve: stamp resolved_at (the batch's evaluation time, supplied by the job)
+    AND resolved_last_seen = the incident's last_seen at that moment. resolved_at is
+    stamped once per transition, never refreshed by re-runs.
+  - re-open: a resolved incident with last_seen > resolved_last_seen -> recurring
+    (NOT plain open - recurring's one meaning is "came back after we closed it"; it is
+    also the flap signal: 60 live entities interleave successes and failures within 48h,
+    so close->re-open cycling WILL happen and must be visible). The comparison is
+    last_seen vs resolved_last_seen - both producer-clock values - NEVER vs resolved_at
+    (DB clock): a producer whose clock trails the DB could otherwise advance last_seen
+    without ever exceeding resolved_at, leaving the incident resolved while failing.
+    Clear resolved_* on re-open? NO - keep them as history of the last resolution; the
+    state field says it's back.
+  - acknowledged and suppressed are reserved for a future human/dashboard action - the
+    engine defines but NEVER SETS them. The transition table must still define behavior
+    FROM them: acknowledged is auto-closeable (recovery and staleness both apply - ack
+    means "a human saw it", not "keep it open"); suppressed is ENGINE-TERMINAL (no engine
+    transition out, ever - only a human un-suppresses).
+- db/schema.sql: add resolved_last_seen TIMESTAMPTZ to incidents.incidents (CREATE + an
+  idempotent Phase 5 UPGRADE section - mirror the entity/type precedents). Update
+  docs/incidents-schema.md to match.
+- jobs/assess (state step): runs AFTER assessment in the same job. Evaluates ALL incidents
+  from durable facts every run (the Phase 4 sibling-staleness lesson - no touched-only
+  predicate; no watermark: re-runnability is a property of recomputing from durable facts),
+  writes only rows whose state actually changed (no-op filter; unchanged rows must not
+  churn updated_at every cron cycle).
+- domain/state.js: the PURE transition function - (incident facts + recovery facts +
+  evaluation time) -> {state, resolved_reason?} or no-change. NO clock inside (the job
+  supplies the evaluation timestamp), no DB handle, no network. The original prompt's
+  "resolved_at=now()" wording is superseded: the pure function never calls now().
+- utils/db/queries/recovery.js: the oracle lookup (max successful capture_datetime per
+  entity for this batch's incident entities). SELECT-only. 89k rows live - bound sanely
+  and confirm the plan in Step 2.
 
 Non-goals:
-- NO auto-remediation (L4): action_state/action_ref columns exist but are never written.
+- NO auto-remediation (L4): action_state/action_ref exist but are never written.
 - No notifications. No human-transition UI. No writes outside incidents. No LLM.
+- No flap dampening/hysteresis: this phase makes flapping VISIBLE (recurring), not
+  suppressed. If churn proves noisy, hysteresis is a future, logged decision.
+- severity is NOT a state input - lifecycle and severity stay orthogonal this phase.
+- The queued classification phase (Phase 4 M2 follow-up) runs AFTER this phase
+  (developer-decided 2026-07-16) and keeps its obligations (interim-M2 reason string,
+  RULES_VERSION bump).
 
 Expected files / layers:
 - domain/state.js (pure transition function), jobs/assess/* (state step),
-  utils/db/queries/recovery.js (the oracle lookup), test/state.test.js.
+  utils/db/queries/recovery.js (oracle lookup), db/schema.sql (resolved_last_seen +
+  UPGRADE), test/state.test.js, and REWORKS OF TWO EXISTING TESTS (in scope, not
+  incidental - see validation).
 
 Expected validation:
-- node --test: transition table incl. auto-close given a mock {successful_acquisition:true,
-  capture_datetime > last_seen}, and re-open on post-resolve recurrence; suppressed/
-  acknowledged never engine-set.
-- Live smoke: pick a system_id with a later successful_acquisition -> its incident flips to
-  resolved/auto_recovery; a still-failing system stays open/recurring. Re-run idempotent.
+- node --test: full transition table - NULL/new->open; recovery close (mock success later
+  than last_seen) incl. the capture_datetime-vs-inserted_at ordering; staleness close at
+  the STALE_AFTER_DAYS boundary (quiet 1-3d incidents must NOT close); precedence
+  (recovery beats stale when both apply); re-open on last_seen > resolved_last_seen incl.
+  the producer-clock-skew case (last_seen advanced but still < resolved_at - MUST re-open);
+  re-open lands on recurring, not open; acknowledged auto-closes; suppressed is never
+  entered or left by the engine; resolved_at stamped once, stable across re-runs;
+  determinism (same facts -> same transition).
+- integration/assess_parity.js: UPDATE the Phase 5 boundary check - action_* still NULL
+  everywhere; state within vocabulary; acknowledged/suppressed never engine-set; the
+  ASSESSOR still writes no state (its ColumnSet stays the enforcement).
+- integration/rep_determinism.js: REWORK REQUIRED BEFORE the state step ships - its
+  TRUNCATE-restore only works while every column is a pure function of L0 facts;
+  state/resolved_at/resolved_last_seen are history-dependent, so it must snapshot-and-
+  restore (or use a scratch table). This is the recorded Phase 4 landmine coming due.
+- Live smoke: apply schema; run assess -> backlog initialized (0 NULL states), ~164
+  incidents (2026-07-16 measurement - will have moved) resolve with reason
+  'auto_recovery', quiet-beyond-7d ones with 'stale'; a still-failing system stays open;
+  re-run -> 0 written; take a resolved incident whose problem recurs (or stage one) ->
+  recurring. Read the rows - the wiring has no unit coverage (Phases 3 and 4 both shipped
+  wiring defects under green suites).
 
 Write-isolation / least-privilege / idempotency / determinism constraints:
-- domain/state.js pure; state transitions deterministic. stats.acquisition_history
-  SELECT-only. Writes only state columns on incidents.incidents. Re-run idempotent.
+- domain/state.js pure; transitions deterministic; the engine never sets acknowledged/
+  suppressed; stats.acquisition_history SELECT-only; writes only the state columns
+  (state, resolved_at, resolved_reason, resolved_last_seen, updated_at) on
+  incidents.incidents - enforce via a dedicated ColumnSet with exactly those columns
+  (the incidents_assessment precedent). Re-run idempotent (0 written when nothing moved).
+  No new grant expected (the role owns incidents) - verify.
 
 Schema assumptions to confirm live (Step 2):
-- stats.acquisition_history.successful_acquisition semantics and the timestamp used for
-  "later than last_seen" (capture_datetime vs inserted_at) - confirm which reliably orders
-  recovery after the incident.
+- Re-measure EVERYTHING in notes/phase_5_reevaluation.md - the pipeline is cron-live and
+  those are 2026-07-16 snapshots: oracle reach (305/504), day-one close set (164), the
+  quiet-recency distribution justifying STALE_AFTER_DAYS=7, capture_datetime null rate
+  (0/89k), and the 60-entity flap set.
+- Confirm the oracle lookup's query plan (BRIN on inserted_at; 89k rows) before freezing
+  the recovery SQL.
+- Confirm no fingerprint/entity churn since Phase 4 that would change the transition
+  table's inputs.
 
 Review questions:
-- Is auto-close strictly deterministic and correctly ordered (recovery AFTER last_seen)?
-- Does re-open prevent stale auto-closes from masking recurrences?
-- Are acknowledged/suppressed and action_* left untouched by the engine?
+- Is every transition strictly deterministic and derived from durable facts (re-run-stable,
+  order-independent)? Is auto-close correctly ordered (capture_datetime > last_seen)?
+- Does re-open via resolved_last_seen actually neutralize producer-clock skew? Is there
+  any remaining cross-domain comparison?
+- Can the engine EVER set or leave acknowledged/suppressed? Can anything write action_*?
+- Does 'stale' at 7 days close anything that is merely between recurrences (the 77
+  quiet-1-3d incidents must survive)?
+- Is the flap story honest - do close->re-open cycles surface as recurring rather than
+  churning silently?
+- Did rep_determinism.js get REWORKED (not patched) before the state step landed?
