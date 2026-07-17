@@ -254,10 +254,18 @@ pinning the semi-join. 156/156 unit; re-run 0. F3 not closed operationally — s
 
 Deferred findings:
 
-- **F3's root-requiring infra step (worktree + cron edit) — the single outstanding action
-  of this phase.** The runbook is written (`DEPLOYMENT.md` §Deploy boundary); the reviewer
-  correctly holds it open until `/opt/apps/incident-engine-deploy` exists and the cron
-  points at it. Developer action.
+- **F3 infra step: DONE (2026-07-17, post-merge, developer-delegated).** It turned out to
+  need no root at all — the cron line lives in the operating user's crontab and /opt/apps
+  is docker-group-writable. `/opt/apps/incident-engine-deploy` created as a git worktree
+  pinned to the reviewed merge commit `8307bd5`; `.env` copied; the crontab's one line
+  re-pointed (full backup at `~/crontab.backup.20260717-140908`; diff verified to be
+  exactly that line before install). Proven by running the exact cron command from the
+  deploy worktree (exit 0, self-log written); the next :25 tick watched as confirmation.
+  One incident during install: a mangled temp path made the first `crontab <file>`
+  invocation fail — the existing crontab was verified untouched before retrying via a
+  short path. From now on a `git checkout` in the dev tree touches nothing in production;
+  deploys are the two-command runbook in DEPLOYMENT.md §Deploy boundary. F3 ready for
+  final re-verdict.
 
 ## Problems Encountered
 

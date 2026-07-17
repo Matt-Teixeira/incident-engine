@@ -53,8 +53,11 @@ bind-mounted from `/opt/resources/node_mod_cache/incident-engine`.
 **One** cron line calling `run`, half-hourly at **:25/:55** — installed in the host crontab:
 
 ```cron
-25,55 * * * * cd /opt/apps/incident-engine && docker compose run --rm app node index.js run
+25,55 * * * * cd /opt/apps/incident-engine-deploy && docker compose run --rm app node index.js run
 ```
+
+(The directory is the DEPLOY WORKTREE since 2026-07-17 — see "Deploy boundary" below. From
+2026-07-16 to 2026-07-17 it was `/opt/apps/incident-engine`, the mutable dev tree.)
 
 Why one line, not two staggered ones: `materialize` and the `assess` aggregate **serialize on
 a shared watermark row lock** (`pipeline_state['util.app_run_logs']` — see
@@ -100,30 +103,27 @@ Verify against the DB (as a superuser or the role):
 - the self-log identity is DB-enforced:
   `INSERT INTO util.incident_engine_self_log(app_name, ...) VALUES ('data_acquisition', ...);  -- expect: check option violation`
 
-## ⚠ Deploy boundary (Phase 5 review, medium — INFRA STEP PENDING)
+## Deploy boundary (Phase 5 review F3 — INSTALLED 2026-07-17)
 
-**The cron currently executes the mutable working tree.** `docker-compose.yaml` mounts
-`./:/workspace` and the cron line `cd`s into this directory — so a `git checkout`, or
-half-saved uncommitted edits, are LIVE at the next :25/:55 tick with no deploy boundary.
-Both Phase 4 and Phase 5 branch code ran in production before review this way.
+The cron runs from a **dedicated deployment worktree**, `/opt/apps/incident-engine-deploy`,
+pinned to a reviewed commit (installed at `8307bd5`, Phase 5). The dev tree
+(`/opt/apps/incident-engine`) keeps its compose mount for development and smoke tests, but
+checking out a branch there no longer touches production. Before this (Phases 3–5
+development), the cron executed the mutable dev tree — a `git checkout` was an accidental
+deploy, and both Phase 4 and Phase 5 branch code ran in production before review.
 
-Decided fix (pending the infra step, which needs root): run cron from a **dedicated
-deployment worktree** that only ever points at a reviewed, committed ref:
+**Per deploy** (after a phase is reviewed, committed, merged, and pushed):
 
 ```bash
-# one-time (root or a user with /opt/apps write):
-git -C /opt/apps/incident-engine worktree add /opt/apps/incident-engine-deploy main
-cp /opt/apps/incident-engine/.env /opt/apps/incident-engine-deploy/.env   # gitignored, copied not linked
-# edit the cron line to: cd /opt/apps/incident-engine-deploy && docker compose run --rm app node index.js run
-
-# per deploy (after a phase is reviewed, committed, and merged):
-git -C /opt/apps/incident-engine-deploy fetch origin && git -C /opt/apps/incident-engine-deploy checkout <reviewed-sha>
-# then re-apply db/schema.sql if the phase changed it, and smoke per this runbook
+git -C /opt/apps/incident-engine-deploy fetch origin
+git -C /opt/apps/incident-engine-deploy checkout <reviewed-sha>
+# re-apply db/schema.sql FIRST if the phase changed it, then smoke per this runbook
 ```
 
-The dev tree keeps its mount (that's what makes `docker compose run` smoke tests work);
-only the CRON pointer moves. Until the infra step happens, treat `git checkout` in this
-directory as a production deploy — because it is.
+Notes: no root needed — the cron line lives in the operating user's crontab and
+`/opt/apps` is docker-group-writable. `.env` is gitignored and was COPIED (not linked)
+into the worktree; if credentials rotate, update both copies. Rollback = point the
+crontab line back at a previous SHA (or, worst case, the dev tree).
 
 ## Rollback
 
