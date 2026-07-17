@@ -18,7 +18,8 @@ Prompt:
 committed `d8eab9f`)
 
 Git Commit:
-Pending
+`0367268` (phase, all 4 review rounds squashed into one commit; ff-merged to `main`,
+pushed; deploy worktree pinned `0367268`)
 
 Review Artifacts:
 
@@ -179,6 +180,28 @@ validation runs are production WRITES — a phase whose writes were not version-
 would corrupt, not oscillate. Isolation story for validation = open question, put to the
 reviewer.
 
+**RESOLVED AT DEPLOY (2026-07-17, commit `0367268`).** The deploy worktree moved
+`8307bd5` → `0367268`; both trees now run v2, so no scheduled v1 writer remains and the
+oscillation is structurally over. Post-deploy the `18:40` deploy-tree run landed pre-burst
+(watermarked materialize won't re-classify the batch the 18:25 v1 tick already stamped
+`unknown`), so convergence waited for the **`18:55` production cron tick (v2)** to pull the
+:45 burst through the engine classifier. Definitive post-deploy measurement at `18:57`
+(production cron, not a dev run — the true smoke test):
+
+- **`unknown`: 79 incidents / 38,900 events** (from 213 / ~185k at phase start).
+- `input_file_missing` 74 / 73,200 · `no_new_data` 49 / 23,907 · `job_halted` 1 / 31,862 ·
+  `unhandled_type_error` 26 / 12,688 · `tunnel_not_found` 1 / 15,222 ·
+  `credential_decrypt_error` 6 / 2,928 · `config_missing` 2 / 976. (`datetime_parse_null` /
+  `counter_reset_reread` dormant — 0 current events.)
+- **severity: medium 262 / high 197 / info 50**; **assessor_version v2 on all 509** — the
+  whole table at one version. These match the round-1 corrected snapshot exactly, now
+  production-verified and STABLE (the next tick is v2 too — nothing reverts them). The two
+  reverted-text families (`No new monitoring data found.`, bare `File not found`) sit in
+  `unknown`/medium as intended.
+- The residual 79 `unknown` are the dormant known-family stragglers + the two deliberately-
+  ambiguous texts + the deliberate `rsync_mmb` generic — the honest floor, not the pretty
+  one.
+
 ## Review Notes
 
 Source:
@@ -275,9 +298,11 @@ Critical issues:
 
 ## Follow-Up Tasks
 
-- Codex review; iterate; commit; then DEPLOY (fetch + checkout in the worktree — this
+- ~~Codex review; iterate; commit; then DEPLOY (fetch + checkout in the worktree — this
   phase's convergence completes there; re-measure the unknown bucket and final severity
-  distribution post-deploy and record them).
+  distribution post-deploy and record them).~~ **DONE** — 4 review rounds converged;
+  committed `0367268`, ff-merged to `main`, pushed; deploy worktree pinned `0367268`;
+  post-deploy convergence measured at 18:57 (see the oscillation-RESOLVED section above).
 - Upstreaming the proven engine entries into `data_acquisition`'s connection_regex.js —
   tracked open decision, now with a concrete candidate file.
 - **Producer fixes surfaced by review (cross-app — never made from this repo):**
