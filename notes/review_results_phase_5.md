@@ -185,3 +185,26 @@ and verified; the one open item is operational (F3 infra), deliberately sequence
 post-merge. The phase's headline lesson mirrors Phase 4's: an identifier match
 (system_id) is not semantic evidence — provenance must be carried, gated on, AND enforced
 at the evidence source, with a fail-closed audit for the day the assumption rots.
+
+---
+
+# Final verdict (round 3 addendum)
+
+**F1: closed. F2: closed. F3: closed.** Reviewer-verified for F3: the deploy worktree
+exists, clean and detached at the reviewed commit `8307bd5`; deployment `.env` present;
+the installed cron runs from `/opt/apps/incident-engine-deploy`; dev and deploy worktrees
+are separate. The reviewer conditioned continued closure on the post-deploy smoke — the
+next cron tick from the new line.
+
+**Post-deploy smoke: PASSED.** The 14:25 UTC tick (2026-07-17) fired from the deploy
+worktree — self-log row at 14:25:04, exit clean, and the run did real work
+(`{"opened":0,"reopened":10,"auto_recovery":3,"stale":0}`). F3 remains closed.
+
+Operational observation from that tick, for the record: 10 re-opens in one cycle is the
+steady-state flap the re-evaluation predicted, now fully visible as `recurring` (and
+scope-verified — parity fails on any non-data_acquisition auto_recovery history). This is
+the designed behavior surfacing real transport instability, and the standing dataset for
+the "is two-cycle flap rhythm right?" watch item when an operator surface exists.
+
+**Phase 5 is fully closed**: three review rounds, 1 high + 3 medium, every finding fixed
+and verdicted closed, the deploy boundary installed and smoke-confirmed.
