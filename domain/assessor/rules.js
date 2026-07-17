@@ -55,17 +55,22 @@
 // severity NOWHERE in this file — it appears only in reasons and confidence.
 //
 // ============================================================================
-// COVERAGE: all 22 categories resolve (20 in the table + 2 caller-set)
+// COVERAGE: all categories resolve (20 production + 9 engine + 2 caller-set)
 // ============================================================================
 // R0 provenance gate (rounds 1+2)              → 'oracle': assess as `unknown`, quiet;
 //                                                 missing/invalid: medium @0.2, LOUD, never info
-// R1 unknown           (caller-set)            → medium @0.3 both types (interim — round-2 M2 decision; classification follow-up pending)
+// R1 unknown           (caller-set)            → medium @0.3 both types (PERMANENT policy, Phase 6 developer-decided)
 // R2 hanging_exec      (caller-set)            → medium (low on WARN? no — see R2)
 // R3 not in the taxonomy                       → documented default (medium, low confidence)
 // R4 successful_acquisition:true (4 cats)      → data acquired: info, or low if a human is flagged
 // R5 manual_intervention:true   (5 cats)       → high (WARN only lowers confidence)
 // R6 error_type 'connection'    (10 cats)      → transport: blast-radius split, both types
-// R7 error_type 'file'          (1 cat)        → medium (WARN only lowers confidence)
+// R7 error_type 'file'          (1+1 cats)     → medium (WARN only lowers confidence;
+//                                                 incl. engine input_file_missing — developer-decided)
+// R7b engine types (Phase 6): 'halt' → medium; 'crash' → medium; 'quality' → medium
+//                             (round-2 review: verified downstream failure — was low);
+//                             'status' → info; 'config'/'credentials' ride R5 via
+//                             manual_intervention
 // R8 anything else in the table                → same documented default as R3
 //
 // R4 BEFORE R5 IS A DELIBERATE PRECEDENCE DECISION, not table order.
@@ -97,6 +102,7 @@
 "use strict";
 
 const { connection_regexes } = require("../../utils/classify/connection_regex");
+const { engine_regexes } = require("../../utils/classify/engine_regexes");
 const { SEVERITY, EVENT_TYPE } = require("./contract");
 
 // The rules content version, stamped per row as `assessor_version` (mirrors the
@@ -106,7 +112,10 @@ const { SEVERITY, EVENT_TYPE } = require("./contract");
 // indistinguishable from a current one — `assessor_kind` stays 'rules' either
 // way. (jobs/assess re-assesses every incident every run, so this is provenance
 // rather than the re-assess trigger — see that file's SCOPE note.)
-const RULES_VERSION = 1;
+// v2 (Phase 6): engine classifier layer — new categories with producer-evidence
+// severities; interim-M2 reason retired for the permanent residual-unknown
+// policy. The bump makes every stored assessment re-stamp exactly once.
+const RULES_VERSION = 2;
 
 // Blast-radius escalation threshold: distinct entities sharing one fingerprint.
 //
@@ -144,9 +153,9 @@ const HANGING_EXEC = "hanging_exec";
  *
  * @returns {Object<string, {error_type: string, manual_intervention: boolean, successful_acquisition: boolean}>}
  */
-const buildTaxonomy = () => {
+const buildTaxonomy = (entries) => {
   const table = Object.create(null);
-  for (const entry of connection_regexes) {
+  for (const entry of entries) {
     if (table[entry.error_category]) continue;
     table[entry.error_category] = Object.freeze({
       error_type: entry.error_type,
@@ -154,10 +163,17 @@ const buildTaxonomy = () => {
       successful_acquisition: entry.successful_acquisition === true,
     });
   }
-  return Object.freeze(table);
+  return table;
 };
 
-const TAXONOMY = buildTaxonomy();
+// Production categories FIRST, engine second — on a (never-intended, unit-
+// forbidden) slug collision the production entry wins, mirroring the runtime
+// layering. Both vocabularies dispatch through the same rules below.
+const PRODUCTION_TAXONOMY = Object.freeze(buildTaxonomy(connection_regexes));
+const ENGINE_TAXONOMY = Object.freeze(buildTaxonomy(engine_regexes));
+const TAXONOMY = Object.freeze(
+  Object.assign(Object.create(null), ENGINE_TAXONOMY, PRODUCTION_TAXONOMY)
+);
 
 // category → what a human should actually do. Maps from category (per the
 // prompt). Keyed by category so a corroborated/typeless row still gets the right
@@ -193,8 +209,24 @@ const ACTIONS = Object.freeze({
   partial_transfer_timeout: "Check link stability — the remote accepted then stalled mid-stream.",
   rsync_io_timeout: "Check host reachability and link stability — rsync stalled after its handshake.",
   rsync_protocol_error: "Check link stability — the rsync data stream was disrupted mid-transfer.",
+  // engine-layer categories (Phase 6) — actions cite the producer evidence
+  tunnel_not_found:
+    "Add or fix the IPsec tunnel row for this system's IP — auto-reset cannot remediate it until then.",
+  config_missing:
+    "Fill the missing field (host_ip / credentials_group / acquisition_script) on the system row — no acquisition until fixed.",
+  credential_decrypt_error:
+    "Re-encrypt or fix the stored credential row — decryption fails, so acquisition cannot authenticate.",
+  job_halted: "Investigate why the job produced nothing (the rsync yielded no file).",
+  input_file_missing:
+    "Check the upstream pull for this system — the expected input file never arrived, so post-processing produced nothing.",
+  unhandled_type_error:
+    "File a producer bug: an unhandled TypeError in the parser — needs a developer fix, not an operator action.",
+  datetime_parse_null:
+    "Fix the producer(s): records are stored with a null host_datetime, and a null in the record selected for the alert.offline_hhm_conn upsert breaks it (quoted 'null' rejected by timestamptz) across the Philips/GE/Siemens post-processors — skip/null-handle invalid timestamps or select a VALID one (note CV/eventlog selects the first record, the rest the last); also fix the parser pattern.",
+  no_new_data: "No action — nothing new to process; the normal state between acquisitions.",
+  counter_reset_reread: "No action — the producer detected the rotation and re-read the whole file.",
   // caller-set
-  [UNKNOWN]: "Add a classifier pattern to connection_regex.js for this message, then re-assess.",
+  [UNKNOWN]: "Add an engine_regexes.js pattern (or a producer-evidence verdict) for this message, then re-assess.",
   [HANGING_EXEC]: "Investigate the hung command on this host; confirm the exec timeout is appropriate.",
 });
 
@@ -348,17 +380,13 @@ const assess = async (dossier) => {
       category,
       0.3,
       [
-        "unclassified — needs pattern",
-        "no classifier pattern matched this message",
+        "unclassified — needs a pattern or a producer-evidence verdict",
+        "no classifier pattern matched this message (production mirror and engine layer both missed)",
         ...provenance,
         isWarn
           ? "producer labeled this WARN rather than ERROR — which says nothing about whether the acquisition succeeded"
-          : "producer labeled this ERROR — a real failure the taxonomy does not yet recognize",
-        ...(isWarn
-          ? [
-              "interim severity (review round 2, M2): the unclassified WARN bucket contains confirmed hard failures, so WARN must not reduce this to info; medium until these messages are classified",
-            ]
-          : []),
+          : "producer labeled this ERROR",
+        "permanent policy (Phase 6, developer-decided): an unrecognized message is conservatively medium, both types, until classified",
       ],
       actionFor(UNKNOWN)
     );
@@ -521,6 +549,90 @@ const assess = async (dossier) => {
       actionFor(category)
     );
   }
+
+  // ---- R7b: engine-layer error_types (Phase 6) -----------------------------
+  // Each type's severity is the family's PRODUCER-EVIDENCE verdict (quoted at
+  // the entry in engine_regexes.js), not its WARN/ERROR label. `type` still
+  // moves severity nowhere; it shades confidence only.
+
+  // A hard run failure: the producer stopped without producing (JOB HALTED —
+  // the Phase 4/5 review's own evidence family).
+  if (entry.error_type === "halt") {
+    return result(
+      SEVERITY.MEDIUM,
+      category,
+      isWarn ? 0.8 : 0.85,
+      [
+        "the producer halted without acquiring — the run produced nothing (producer evidence at the engine_regexes.js entry)",
+        isWarn
+          ? "producer labeled this WARN rather than ERROR — which says nothing about whether the acquisition succeeded"
+          : "producer labeled this ERROR",
+        blastReason,
+      ],
+      actionFor(category)
+    );
+  }
+
+  // An unhandled exception in the producer: a code defect needing a developer.
+  if (entry.error_type === "crash") {
+    return result(
+      SEVERITY.MEDIUM,
+      category,
+      isWarn ? 0.6 : 0.7,
+      [
+        "unhandled exception in the producer — a code defect on unexpected input; needs a developer, not an operator",
+        blastReason,
+      ],
+      actionFor(category)
+    );
+  }
+
+  // A data-quality anomaly with a VERIFIED downstream failure mode (review
+  // round 2 → medium, generalized round 3): the producer KEEPS the record with
+  // a null host_datetime, and the post-processors that emit this message feed a
+  // SELECTED record's host_datetime into the alert.offline_hhm_conn upsert via
+  // build_upsert_str (a quoted '${host_datetime}' → the string 'null' →
+  // PostgreSQL rejects it for timestamptz), so the offline-health row goes
+  // stale for that system when the selected record is a null one. Round-3
+  // review verified the count CROSS-VENDOR: of the 8 emitters of "datetime
+  // object null", 7 share the identical upsert (the exact 8-row table is at the
+  // engine_regexes.js datetime_parse_null entry). The one exception (Philips
+  // CV/lod_eventlog) persists the null but has no upsert. The SELECTED record
+  // is the LAST for six paths but the FIRST for Philips CV/eventlog
+  // (mappedData[0]) — either way a null in it breaks the upsert.
+  // The category is not source-aware (identical text, error_category not in the
+  // fingerprint), so the verdict is deliberately CONSERVATIVE-MEDIUM across all
+  // matches rather than claiming every one breaks the upsert.
+  if (entry.error_type === "quality") {
+    return result(
+      SEVERITY.MEDIUM,
+      category,
+      0.7,
+      [
+        "data-quality anomaly with a verified downstream failure mode — the producer keeps the record with a null host_datetime; across the Philips/GE/Siemens post-processors that feed a selected record into the alert.offline_hhm_conn upsert (7 of 8 emitters of this message), a null in the selected record sends a quoted 'null' to a timestamptz and the offline-health row goes stale for that system",
+      ],
+      actionFor(category)
+    );
+  }
+
+  // The normal between-acquisition state: nothing new to process / self-healed.
+  if (entry.error_type === "status") {
+    return result(
+      SEVERITY.INFO,
+      category,
+      0.9,
+      [
+        "normal between-acquisition state — the producer had nothing new to process (or self-healed and continued)",
+      ],
+      actionFor(category)
+    );
+  }
+
+  // NOTE: engine error_type 'config' needs no branch — those entries carry
+  // manual_intervention: true and resolve through R5 (a human must fix the
+  // row); 'credentials' likewise; engine 'file' entries resolve through R7
+  // (the production file-family semantics, deliberately reused —
+  // input_file_missing's medium is the developer-decided verdict).
 
   // ---- R8: in the taxonomy, but no rule matched ----------------------------
   // THE PRINCIPLED DEFAULT. Unreachable for today's 20 categories (R4–R7 cover

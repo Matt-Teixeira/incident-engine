@@ -5,6 +5,313 @@ Durable memory of what's been done and why. Newest entry at the top. Add an entr
 
 ---
 
+# Phase 6 — Engine Classifier Layer: Classify the Unknowns
+
+Date:
+2026-07-17
+
+Status:
+Completed
+
+Prompt:
+`prompts/prompt_6_classify_unknowns.txt` (written from live evidence the same day;
+committed `d8eab9f`)
+
+Git Commit:
+Pending
+
+Review Artifacts:
+
+- Codex handoff: `notes/codex_handoff_phase_6.md`
+- Review results: `notes/review_results_phase_6.md` (pending — developer runs the review)
+
+## Goals
+
+- Classify the known message families out of `unknown`, each severity from PRODUCER
+  EVIDENCE (the F2 standard: what the producer DOES after emitting, never the label), via a
+  layered engine-owned classifier that can extend but never shadow the verbatim production
+  mirror. Discharge the Phase 4/5 review obligations (interim-M2 reason string removed;
+  `RULES_VERSION` → 2). **Non-goals held:** `connection_regex.js` untouched; FP_VERSION 1;
+  no L0 rewrite; no state-machine/oracle changes; no upstreaming (tracked).
+
+## Built
+
+- `utils/classify/engine_regexes.js` — 9 engine categories, each entry citing the producer
+  file/lines that justify its verdict. New `error_type` vocabulary: `config`, `halt`,
+  `crash`, `quality`, `status` (plus deliberate reuse of production `credentials`/`file`
+  semantics where they genuinely match).
+- `domain/classify.js` — two ordered layers: production mirror first, engine table ONLY on
+  a miss, `unknown` only when both miss. Still pure.
+- `domain/assessor/rules.js` — R7b branches for the new error_types (halt→medium,
+  crash→medium, quality→medium — review round 2, was low —, status→info; config/credentials ride R5 via
+  manual_intervention; engine `file` rides R7 — `input_file_missing`'s medium is
+  developer-decided); per-category actions citing the evidence; R1 rewritten to the
+  PERMANENT residual policy (developer-decided: medium both types; "interim" language
+  retired and unit-asserted absent); `RULES_VERSION = 2`.
+- Tests (196 total, +27): layer precedence; a 26-text no-collision sweep (one real sample
+  per production pattern — no engine regex may match any of them); one classification test
+  per family from the producers' real messages; per-family severity table with a
+  no-silent-additions guard; counts restructured (20 production + 9 engine + 2 caller-set
+  = 31, zero slug collisions); interim language asserted gone.
+- Docs: `docs/error-taxonomy.md` restructured as two layers with the engine-verdict table;
+  `docs/incidents-schema.md` category note. NO schema change (verified — classification is
+  vocabulary, not storage).
+
+## The Verdicts (producer evidence quoted at each engine_regexes.js entry)
+
+| category | evidence in one line | severity |
+| --- | --- | --- |
+| `tunnel_not_found` | failing IP has no tunnel row → auto-reset impossible, `continue` | high |
+| `config_missing` | system row lacks config → skipped "so ops can fix the row" | high |
+| `credential_decrypt_error` | stored credential fails decrypt → cannot authenticate | high |
+| `job_halted` | rsync produced nothing → job returns (the F2 family; NON-CONFORMANT variant re-homed to `config_missing` in review round 1) | medium |
+| `input_file_missing` | upstream file absent → run yields nothing for that SME (incl. GE's explicit dir message — round 1; bare "File not found" reverted to `unknown`, ambiguous across producers) | medium* |
+| `unhandled_type_error` | TypeError reaches CATCH — parser code defect | medium |
+| `datetime_parse_null` | record KEPT with null `host_datetime`; a null LAST record breaks the offline-health upsert (round 2 — was low) | medium |
+| `no_new_data` | nothing new to process — GE-delta + rmmu shapes only (monitoring text reverted to `unknown`, round 1 HIGH) | info |
+| `counter_reset_reread` | file shrank → producer re-reads whole file, continues | info |
+
+\* developer-decided 2026-07-17, as was the residual-`unknown` policy (medium, both types,
+permanent). Deliberately still `unknown`: the generic `Command failed: ...rsync_mmb.sh`
+wrapper — inconclusive, not guessed.
+
+## Schema Facts Confirmed (live DB)
+
+- The unknown bucket at implementation: 213 incidents / ~184k events, decomposing into the
+  12 families above (Step 2 re-measured; the prompt's table was same-day).
+- All producer evidence read directly: `data_acquisition` (get-tunnels-by-ip.js,
+  hhm/_shared.js, hhm/_configs.js + encrypt/), `hhm_rpp_ge` (GE_CT_CV_MRI.js,
+  tooling/gzip_file.js), `hhm_rpp_philips` (insert_jsonb_data.js, lod_eventlog.js,
+  eal_parser.js, Philips_MRI_Logcurrent.js, logcurrent.js, rmmu_*.js, util/gzip_file.js) —
+  sandbox access confirmed this session, no pairing needed.
+
+## Important Decisions
+
+### The layered classifier (made in the prompt, held)
+
+The production mirror is never edited and never shadowed; engine vocabulary is a separate,
+engine-owned file consulted only on production miss. Re-sync stays a file copy; upstreaming
+stays a clean one-file proposal; identity untouched (category is not in the fingerprint).
+
+### `input_file_missing` reuses production `file` semantics → medium (developer-decided)
+
+~110 per-SME incidents. A scanner whose telemetry is not flowing is a real actionable gap;
+dormant ones stale-close. The alternative (low) would have hidden broken pipelines among
+dormant SMEs.
+
+### Residual `unknown` = medium, both types, PERMANENT (developer-decided)
+
+Replaces the interim-M2 rule. An unrecognized message is conservatively actionable until a
+pattern or producer-evidence verdict exists. Residual volume is tiny (the ~5-event generic
+wrapper + future novelties).
+
+### The deploy boundary shaped validation (a first)
+
+The production cron runs the PINNED Phase 5 code, so events consumed by cron ticks still
+classify `unknown` until this phase deploys — dev-tree manual runs demonstrate convergence
+only on the event slices they materialize first. This is the boundary WORKING (unreviewed
+code no longer leaks into production), at the price of staged convergence: full bucket
+collapse completes at deploy. Validation therefore proves the mechanism per-family, not the
+end-state numbers.
+
+## Architecture Notes
+
+- Write-isolation/least-privilege: no new write surface, no grant, no schema change.
+- Determinism: classify stays pure (two ordered tables); assessor pure; version provenance
+  via `assessor_version=2` on every row (the one-time full re-stamp, expected).
+- Fingerprint stability: FP_VERSION 1; zero re-bucketing. Mixed-category fingerprints are
+  now REAL (old L0 events 'unknown', new ones classified) — newest-representative-wins
+  converges to the classified category; the Phase 3 prefer-confident caveat stays a caveat
+  (no flap observed; watch item).
+- Idempotency: assess re-run after the v2 re-stamp writes 0.
+
+## Validation
+
+Commands run:
+
+```bash
+docker run --rm -v "$PWD":/w -w /w node:lts node --test        # 196/196 (+27)
+docker compose run --rm app node index.js run                  # new classifier live (dev tree)
+docker compose run --rm app node index.js assess               # re-run: 0 written
+docker compose run --rm app node integration/assess_parity.js  # PASS
+docker compose run --rm app node integration/rep_determinism.js && node integration/aggregate_race.js  # PASS / PASS
+```
+
+Results *(round-0 snapshot — the convergence/severity numbers below were SUPERSEDED by
+review round 1; see Review Notes for the corrected ones)*:
+
+- 196/196 unit. `assessor_version=2` on all 509 (one-time re-stamp; re-run 0). Parity +
+  lifecycle + scope invariants PASS.
+- **Convergence: ~97% complete BEFORE deploy** — the staged-convergence caveat proved
+  overly cautious. The 15:33 slice converged `credential_decrypt_error` ×6 +
+  `config_missing` ×2 (→ high); the timed 15:51 run caught the :45 producer burst ahead of
+  the :55 pinned cron and converged the rest in one pass:
+  `input_file_missing` 121 incidents / 98k events (medium), `no_new_data` 86 / 41k (info),
+  `job_halted` 1 / 31k (medium), `tunnel_not_found` 1 / 15k (high),
+  `unhandled_type_error` 26 / 12.5k (medium). **`unknown` collapsed 213 incidents / ~184k
+  events → 7 incidents / 426 events** — the residuals are exactly the predicted dormant
+  stragglers (3 already resolved; all from known families awaiting their next recurrence)
+  plus the deliberate rsync_mmb generic (whose incident now carries an oracle-corroborated
+  category and is severity-gated by R0 as before).
+- **Severity distribution — before Phase 6 → after:** medium 312 → **225**, high 196 →
+  **197**, info 1 → **87** (509 total; parity + lifecycle + scope invariants PASS over the
+  converged table). The medium deflation is honest relabeling-into-legibility: the 87 info
+  are the status families with producer evidence they are the normal between-acquisition
+  state; the mediums that remain are real per-system gaps (input files not flowing,
+  crashes, halts).
+
+## SELF-CAUGHT POST-VALIDATION: cross-version assessment oscillation (until deploy)
+
+A final-sweep assess re-run wrote 509 when it should have written 0 — read the run history:
+the :55 pinned-cron tick (v1 rules) had rewritten every assessment to v1 (engine categories
+→ the not-in-taxonomy default), and the dev-tree run flipped them back. **The deploy
+boundary isolates code, not DATA: both trees write the shared production DB, and
+version-stamped assess-all turns concurrent rule versions into a 30-minute oscillation.**
+Not corruption (each state internally consistent; lifecycle severity-independent),
+resolves at deploy. **Round-1 correction: "category convergence unaffected" was FALSE** —
+each cron tick that processes a burst stamps the new events `unknown` (v1 classifier) and
+newest-representative refresh flips actively-recurring incidents' CATEGORIES back too
+(measured 17:39: all 213 back to `unknown`, all 509 at v1). The oscillation is total; the
+Results numbers above are transient post-dev-run snapshots; convergence is real only at
+deploy. Interim: no further dev-tree assess runs, so
+the cron owns the table (v1 view) during review. LESSON FOR EVERY FUTURE PHASE: dev-tree
+validation runs are production WRITES — a phase whose writes were not version-idempotent
+would corrupt, not oscillate. Isolation story for validation = open question, put to the
+reviewer.
+
+## Review Notes
+
+Source:
+
+- Codex handoff (round 1): `notes/codex_handoff_phase_6.md`
+- Review results (round 1): `notes/review_results_phase_6.md` — **1 high, 2 medium, 2 low;
+  all five verified real against producer code; all fixed** (196/196 after)
+- Codex handoff (fix round, delta): `notes/codex_handoff_phase_6_fixes.md`
+- Review results (round 2): `notes/review_results_phase_6.md` §Round 2 — prefix +
+  permanent-unknown handling **accepted**; **F4 escalated to medium, verified real**
+- Codex handoff (fix round 2, delta): `notes/codex_handoff_phase_6_fixes_round_2.md`
+- Review results (round 3): `notes/review_results_phase_6.md` §Round 3 — F4 **partially
+  closed** (MRI/CT accepted; generalize the reason/action across all emitters); fixed
+- Codex handoff (fix round 3, delta): `notes/codex_handoff_phase_6_fixes_round_3.md`
+- Review results (round 4): `notes/review_results_phase_6.md` §Round 4 — verdict sound but
+  **evidence miscounted** (8 emitters not 7; 7-of-8 share the upsert; CV/eventlog selects
+  the first record); corrected everywhere authoritative
+- Codex handoff (fix round 4, delta): `notes/codex_handoff_phase_6_fixes_round_4.md` —
+  re-review pending
+
+Round 1 (verdict "needs changes" — the tests passed but "encode several unsupported
+producer assumptions"; correct, three findings were my own citations mis-read):
+
+- **F1 (high):** `No new monitoring data found.` rated info was UNSUPPORTED —
+  `insert_jsonb_data.js` emits it whenever the per-file loop added nothing, and the only
+  paths there are `continue`s (absent file, stale cache, catch-all read error; the
+  `!matches` branch is dead code — `matchAll` is never falsy). Reverted to `unknown`/
+  residual medium until the producer distinguishes the cases. **37 live incidents moved
+  info → medium** — the round's real-world size.
+- **F2 (medium):** `JOB HALTED -> NON-CONFORMANT config` is a pre-acquisition config GATE
+  (`mmb/index.js:37-45`), not a halt → second `config_missing` entry ordered above the
+  generic `^JOB HALTED`; halt citation corrected to `mmb/index.js:74-82`.
+- **F3 (medium):** `input_file_missing` under- and over-matched: GE's thrown
+  `File not found in directory: <path>` (`GE_CT_CV_MRI.js:139-144`) now matches; bare
+  `^File not found$` removed — same text carries OPPOSITE truth values across producers
+  (`lod_eventlog.js` genuine existsSync miss vs `insert_jsonb_data.js` relabel of ANY
+  caught read error). Self-caught on top: my entry cited `eal_parser.js:56-64`, an
+  INFO-level site that never reaches `warn_error_logs`.
+- **F4 (low):** null-datetime records are APPENDED with `host_datetime = null`
+  (`data.push` in both parsers), not skipped — evidence/action corrected, low retained.
+- **F5 (low):** both current-contract docs still stated the superseded interim-unknown
+  policy — updated to the permanent policy. Docs-drift prediction now 6 phases for 6.
+
+Corrected snapshot (timed 17:51 post-burst run): `unknown` 79 / 38,742 (the reverted
+families), `input_file_missing` 74 / 72,900, `no_new_data` 49 / 23,809 (GE-delta + rmmu
+shapes only); severity **medium 262 / high 197 / info 50**. The round-0 "medium 225 /
+info 87" numbers in Results above are SUPERSEDED — 37 of those infos were F1's
+unsupported claim.
+
+Round 2 (on the fix delta): prefix and permanent-unknown handling accepted (upstream
+producer disambiguation is the durable fix for the two ambiguous texts; the conservative
+fallback suffices for this branch). **F4 escalated to medium — verified real, two parts:**
+my round-1 fix corrected the ACTIONS string but missed the R7b reason string (still said
+"skipped"), and — the substantive part — both Philips parsers interpolate the LAST
+record's `host_datetime` into the offline-health upsert (`util/upsertHostDatatime.js`
+quotes the value), so a null last record sends the string `'null'` to a `timestamptz`,
+PostgreSQL rejects it, and `alert.offline_hhm_conn` goes stale for that system. Fixed:
+quality → medium @ 0.7, reason/action rewritten with the evidence, tests/docs updated
+(196/196). Live: family dormant (0 events carry the category; its 2 incidents sit at
+`unknown`/medium already), so the rating binds at deploy. The producer fix itself is
+cross-app — tracked below, not made from this repo.
+
+Round 3 (on the round-2 delta): MRI/CT medium **accepted**; F4 **partially closed** — the
+`datetime object null` regex matches the same exact text from 7 emitters, so the reason/
+action must not claim every match breaks the specific Philips upsert. Verified by full
+producer sweep: **6 of 7 emitters share the identical `build_upsert_str` →
+`alert.offline_hhm_conn` failure mode** (Philips MRI/CT/CV-eventlog, GE MRI/CT/CV, Siemens
+CV — GE/Siemens `build_upsert_str` quote identically); the exception is Philips
+CV/lod_eventlog (persists the null, no upsert). Fixed by GENERALIZING the reason/action to
+the cross-vendor pattern (not source-aware: identical text, `error_category` not in the
+fingerprint → conservative medium across all matches, exception recorded at the entry);
+the cross-app follow-up broadened to cover all emitters (the reviewer's deferral
+condition). 196/196; family dormant, binds at deploy. **[The "7 emitters / 6 of 7 / last
+record" numbers in this paragraph were miscounted — corrected in round 4 below.]**
+
+Round 4 (on the round-3 delta): the generalized medium verdict is sound, but the evidence
+was **miscounted** (reviewer caught it): there are **8 emitters, not 7** (Philips has four —
+MRI, CT, CV/eventlog, CV/lod_eventlog — GE three, Siemens one), **7 of 8 call the upsert**,
+and **Philips CV/eventlog selects the FIRST record** (`mappedData[0]`) where the other six
+select the last. Fixed: "last record" → "selected record" and the count → 8 / 7-of-8
+across the assessor reason/action, the `engine_regexes.js` 8-row table, the taxonomy row,
+and this follow-up (all eight emitters named). The medium verdict and deferral are
+unchanged — only the count/wording. 196/196; family dormant, binds at deploy.
+
+Critical issues:
+
+- None open from rounds 1–4 (all findings fixed; round 4 was an evidence-count correction,
+  no severity change); round-4-delta re-review pending.
+
+## Problems Encountered
+
+- Two trivial test-plumbing fumbles (a referenced-but-unimported helper; a duplicated
+  import) — both caught by the suite immediately.
+
+## Follow-Up Tasks
+
+- Codex review; iterate; commit; then DEPLOY (fetch + checkout in the worktree — this
+  phase's convergence completes there; re-measure the unknown bucket and final severity
+  distribution post-deploy and record them).
+- Upstreaming the proven engine entries into `data_acquisition`'s connection_regex.js —
+  tracked open decision, now with a concrete candidate file.
+- **Producer fixes surfaced by review (cross-app — never made from this repo):**
+  (1) the offline-health upsert breaks on a null selected `host_datetime` (`build_upsert_str`
+  quotes the value → `'null'` rejected by timestamptz) — round-2 F4 found it in Philips
+  MRI/CT; **rounds 3–4 corrected the count: 7 of the 8 emitters of `datetime object null`
+  share the identical upsert — Philips MRI, CT, CV/eventlog, CV/lod_eventlog; GE MRI, CT,
+  CV; Siemens CV** (only Philips CV/lod_eventlog persists the null without an upsert; and
+  Philips CV/eventlog selects the FIRST record `mappedData[0]`, the other six the last).
+  The follow-up covers ALL EIGHT emitters (all four distinct Philips CV+MRI+CT parsers,
+  the three GE parsers, the Siemens one): skip/null-handle or select a VALID timestamp. (2) the two
+  permanently-ambiguous texts (`No new monitoring data found.`, bare `File not found`)
+  need producer-side disambiguation before they can ever classify.
+- Watch: mixed-category fingerprint flap (none observed; prefer-confident is the recorded
+  fix); dormant incidents keeping the old 'unknown' category until they recur or
+  stale-close (counted at deploy).
+- The oracle `error_type` corroboration follow-up (Phase 3) remains separately tracked.
+
+## Commit Readiness
+
+- Requirements implemented: yes — per the prompt; both developer decisions recorded.
+- Rules hold (write-isolation/least-privilege/idempotency/determinism): yes — no new write
+  surface; classify/assess pure; re-run 0.
+- Schema assumptions confirmed live: yes (no schema change needed, verified).
+- Review findings addressed: **yes — converged.** Four Codex rounds (1 high, 2 medium,
+  2 low, then F4 refined medium→generalized→count-corrected across rounds 2–4); all six
+  findings verified real against producer code, fixed, and closed. Reviewer's round-4
+  verdict: "F4 is closed"; remaining items are superseded historical wording, not fix-worthy.
+- Ready to commit: **yes.** 196/196; parity + lifecycle + scope invariants PASS; no schema
+  change; `.env` clean. Awaiting the developer's explicit commit word (commit-on-request
+  discipline).
+
+---
+
 # Phase 5 — State Machine + Auto-Close (L5)
 
 Date:

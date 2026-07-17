@@ -15,6 +15,7 @@ const { assess, BLAST_RADIUS_ENTITIES, TAXONOMY, RULES_VERSION } = require("../d
 const { SEVERITIES, SEVERITY, EVENT_TYPE } = require("../domain/assessor/contract");
 const { getAssessor, resolveKind, DEFAULT_KIND } = require("../domain/assessor");
 const { connection_regexes } = require("../utils/classify/connection_regex");
+const { engine_regexes } = require("../utils/classify/engine_regexes");
 
 // A minimal valid dossier; each test overrides only what it is about.
 const dossier = (over = {}) => ({
@@ -71,17 +72,24 @@ test("assessor: shape and universal invariants", async (t) => {
     }
   });
 
-  await t.test("the taxonomy really does hold 20 categories (22 with caller-set)", () => {
-    // Pins the count the docs and prompt state, so a taxonomy change forces the
-    // docs to be revisited instead of drifting silently.
-    assert.equal(Object.keys(TAXONOMY).length, 20);
-    assert.equal(ALL_CATEGORIES.length, 22);
+  await t.test("the layered taxonomy: 20 production + 9 engine, zero slug collisions", () => {
+    // Pins the counts the docs state, so a taxonomy change forces the docs to
+    // be revisited instead of drifting silently (the '19 categories' lesson).
+    const prod = new Set(connection_regexes.map((r) => r.error_category));
+    const eng = new Set(engine_regexes.map((r) => r.error_category));
+    assert.equal(prod.size, 20, "production mirror category count changed — re-sync the docs");
+    assert.equal(eng.size, 9, "engine layer category count changed — update the docs + this pin");
+    for (const slug of eng) {
+      assert.ok(!prod.has(slug), `engine slug '${slug}' collides with the production vocabulary`);
+    }
+    assert.equal(Object.keys(TAXONOMY).length, 29);
+    assert.equal(ALL_CATEGORIES.length, 31);
   });
 
-  await t.test("TAXONOMY mirrors connection_regex.js exactly", () => {
+  await t.test("TAXONOMY mirrors BOTH regex tables exactly", () => {
     // The rules dispatch on these flags, so a first-entry-wins build that
-    // disagreed with the table would silently mis-severity a whole family.
-    for (const entry of connection_regexes) {
+    // disagreed with the tables would silently mis-severity a whole family.
+    for (const entry of [...connection_regexes, ...engine_regexes]) {
       const built = TAXONOMY[entry.error_category];
       assert.ok(built, `category ${entry.error_category} missing from TAXONOMY`);
       assert.equal(built.error_type, entry.error_type, entry.error_category);
@@ -139,29 +147,35 @@ test("assessor: determinism and purity", async (t) => {
   });
 });
 
-test("assessor: unknown → interim medium for BOTH types (round-2 M2 decision)", async (t) => {
-  // Decision history matters here — see the R1 comment in rules.js. Step 3
-  // type-split this (WARN → info as "noise"); review round 2 held F2 open on it
-  // because the WARN bucket contains CONFIRMED hard failures (JOB HALTED, 28k
-  // events). Developer decision 2026-07-16: interim medium for both types until
-  // the hard-failure messages are classified out of `unknown` (follow-up phase).
-  await t.test("unknown + WARN → medium — never info, and it says why", async () => {
+test("assessor: residual unknown → PERMANENT medium, both types (Phase 6 decision)", async (t) => {
+  // Decision history: Step 3 type-split this (WARN → info as "noise"); review
+  // round 2 held F2 open (the bucket held confirmed hard failures); the M2
+  // decision made it INTERIM medium; Phase 6 classified the known families out
+  // and the developer made medium-both-types the PERMANENT residual policy
+  // (2026-07-17). The interim language is retired — asserted absent below.
+  await t.test("unknown + WARN → medium, permanent-policy reason, no interim language", async () => {
     const res = await assess(dossier({ category: "unknown", type: "WARN" }));
     assert.equal(res.severity, SEVERITY.MEDIUM);
     assert.equal(res.confidence, 0.3);
-    assert.ok(res.reasons.includes("unclassified — needs pattern"));
-    assert.ok(
-      res.reasons.some((r) => r.includes("interim severity")),
-      "the WARN branch must record that medium is an interim M2 decision"
-    );
+    assert.ok(res.reasons.some((r) => r.includes("permanent policy")));
     assert.ok(!res.recommendedAction.startsWith("No action"));
   });
 
-  await t.test("unknown + ERROR → medium, ~0.3 confidence, 'unclassified — needs pattern'", async () => {
+  await t.test("unknown + ERROR → medium, ~0.3 confidence", async () => {
     const res = await assess(dossier({ category: "unknown", type: "ERROR" }));
     assert.equal(res.severity, SEVERITY.MEDIUM);
     assert.equal(res.confidence, 0.3);
-    assert.ok(res.reasons.includes("unclassified — needs pattern"));
+  });
+
+  await t.test("the interim-M2 language is GONE from every reason (round-3 obligation)", async () => {
+    for (const category of ALL_CATEGORIES) {
+      for (const type of ["WARN", "ERROR"]) {
+        const res = await assess(dossier({ category, type, entity_count: 30 }));
+        for (const r of res.reasons) {
+          assert.ok(!/interim/i.test(r), `${category}/${type} still says interim: "${r}"`);
+        }
+      }
+    }
   });
 
   await t.test("type moves severity NOWHERE: WARN and ERROR agree for every category", async () => {
@@ -468,7 +482,8 @@ test("assessor: category provenance gate (review, HIGH finding)", async (t) => {
   });
 
   await t.test("the exact live regressions the HIGH finding found", async () => {
-    // Both resolve as unknown (oracle gate) → interim medium (M2 decision). The
+    // Both resolve as unknown (oracle gate) → residual medium (permanent policy,
+    // Phase 6 — formerly the interim-M2 decision). The
     // point pinned here is that neither inherits its ORACLE category's severity:
     // no blast-radius high, no credentials high.
     const noise = await assess(
@@ -543,5 +558,49 @@ test("assessor: category provenance gate (review, HIGH finding)", async (t) => {
     assert.equal(res.severity, SEVERITY.MEDIUM);
     // no oracle reason, because nothing was discarded
     assert.ok(!res.reasons.some((r) => r.includes("oracle")));
+  });
+});
+
+test("assessor: engine-layer families resolve to their producer-evidence severities (Phase 6)", async (t) => {
+  // One assertion per family — the severity IS the verdict quoted at the
+  // engine_regexes.js entry, and two of them are explicit developer decisions
+  // (2026-07-17): input_file_missing → medium, residual unknown → medium.
+  const expect = {
+    tunnel_not_found: SEVERITY.HIGH,          // manual_intervention → R5
+    config_missing: SEVERITY.HIGH,            // manual_intervention → R5
+    credential_decrypt_error: SEVERITY.HIGH,  // manual_intervention → R5
+    job_halted: SEVERITY.MEDIUM,              // halt → R7b
+    input_file_missing: SEVERITY.MEDIUM,      // file → R7 (developer-decided)
+    unhandled_type_error: SEVERITY.MEDIUM,    // crash → R7b
+    datetime_parse_null: SEVERITY.MEDIUM,     // quality → R7b (round-2 review: null last
+                                              // record breaks the offline-health upsert — was low)
+    no_new_data: SEVERITY.INFO,               // status → R7b
+    counter_reset_reread: SEVERITY.INFO,      // status → R7b
+  };
+
+  await t.test("every engine category is covered by this table (no silent additions)", () => {
+    const engineSlugs = [...new Set(engine_regexes.map((r) => r.error_category))].sort();
+    assert.deepEqual(engineSlugs, Object.keys(expect).sort());
+  });
+
+  for (const [category, severity] of Object.entries(expect)) {
+    await t.test(`${category} → ${severity}, both types`, async () => {
+      for (const type of ["WARN", "ERROR"]) {
+        const res = await assess(dossier({ category, type }));
+        assert.equal(res.severity, severity, `${category}/${type}`);
+        assert.ok(res.reasons.length > 0);
+        assert.ok(
+          res.recommendedAction !== undefined && !res.recommendedAction.includes("add an assessor rule"),
+          `${category} must have a real action, not the R8 generic`
+        );
+        // engine categories must NOT land in the low-confidence defaults
+        assert.ok(res.confidence >= 0.6, `${category} fell to a default branch (confidence ${res.confidence})`);
+      }
+    });
+  }
+
+  await t.test("status-family categories never escalate on blast radius", async () => {
+    const res = await assess(dossier({ category: "no_new_data", type: "WARN", entity_count: 59 }));
+    assert.equal(res.severity, SEVERITY.INFO);
   });
 });
