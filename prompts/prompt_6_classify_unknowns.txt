@@ -1,0 +1,135 @@
+Phase 6 - Engine classifier layer: classify the unknowns
+
+Goal:
+Classify the known message families out of `unknown` - each with a severity derived from
+PRODUCER EVIDENCE, not its WARN/ERROR label - so the interim-medium queue (the Phase 4 M2
+decision) deflates honestly: confirmed hard failures keep a real severity under a real
+category, status noise drops to info, and `unknown` shrinks to messages we genuinely do
+not recognize. Discharges the obligations queued by the Phase 4 review (remove the
+interim-M2 reason string; bump RULES_VERSION) without touching the frozen identity domain.
+
+THE DESIGN DECISION THIS PROMPT MAKES (revisit deliberately in Step 3, not silently):
+a LAYERED engine-local classifier, NOT edits to the copied production table.
+`utils/classify/connection_regex.js` stays a VERBATIM MIRROR of data_acquisition's file -
+that is what makes it re-syncable and keeps docs/error-taxonomy.md's "source of truth"
+claim true. New vocabulary lives in a second, engine-owned table
+(`utils/classify/engine_regexes.js`, same entry shape) consulted ONLY when the production
+table returns no match. The production vocabulary can therefore never be shadowed, a
+future re-sync of the mirror is a plain file copy, and upstreaming proven entries into
+data_acquisition later is a clean diff of one file. `error_category` is NOT in the
+fingerprint, so none of this touches identity: FP_VERSION stays 1 and no incident
+re-buckets.
+
+Scope:
+- utils/classify/engine_regexes.js: an ordered, first-match-wins entry table in the exact
+  connection_regex.js shape (error_category, error_type, message, manual_intervention,
+  successful_acquisition, re - no /g flags, root-cause-before-symptom ordering). Entries
+  are ENGINE VOCABULARY: category slugs must not collide with the production table's 20,
+  and a unit test must prove no engine pattern matches any text a production pattern
+  already matches (the layer may only extend, never reinterpret).
+- domain/classify.js: compose the two layers - production table first, engine table only
+  on no-match, 'unknown' only when BOTH miss. Still pure and deterministic.
+- THE FAMILIES (live 2026-07-17, ~509 incidents; re-measure in Step 2 - counts move):
+
+    data_acquisition   JOB HALTED (31k events, WARN)      <- proven hard failure (F2:
+                                                             rsync produced nothing)
+                       NO TUNNEL FOUND (15k, WARN)
+                       missing host_ip (1k, WARN skip_reason)
+                       TypeError: Invalid authentication tag length (3k, ERROR)
+                       Error: Command failed: ./jobs/mmb/... rsync_mmb.sh (5, ERROR)
+    hhm_rpp_ge         No new file data. Delta: 0 (20k, WARN)
+                       File Not Present / File not present (24k, WARN)
+                       Delta is negative value: -N (rare, WARN)
+    hhm_rpp_philips    File not found / no such file or directory /
+                         File Not Present (52k, WARN)
+                       No new monitoring data found. / No new files detected (21k, WARN)
+                       Error: ENOENT (22k, ERROR)
+                       TypeError: Cannot read properties of null/undefined (12k, ERROR)
+                       datetime object null (138, WARN)
+
+  FOR EACH FAMILY, the verdict (failure vs status, severity, flags) comes from READING THE
+  PRODUCER CODE - the F2 method: what does the producer DO right after emitting this
+  (return false? skip and continue? crash?). The label is not the outcome. (Access to
+  /opt/apps/hhm_rpp_ge and /opt/apps/hhm_rpp_philips source was confirmed readable
+  2026-07-17 - both families grep to their emitting files.)
+  A family whose producer evidence is inconclusive STAYS unknown - do not guess.
+- domain/assessor/rules.js: severity rules for the new categories. Derive from the entry
+  fields where the existing rules already dispatch (successful_acquisition -> info/low,
+  manual_intervention -> high, error_type 'connection' -> blast-radius split); families
+  needing a NEW error_type (e.g. status/halt families) get explicit reasoned branches -
+  they must NOT fall through to the R8 default. Every branch pushes reasons; type still
+  never moves severity.
+- REMOVE the interim-M2 reason string from R1 (round-3 obligation): after this phase the
+  residual `unknown` severity is a PERMANENT policy, not an interim one - re-decide it
+  with the developer in Step 3 (the M2 rationale changes once the known hard failures
+  have their own categories) and write reasons that say what it is.
+- RULES_VERSION -> 2 (round-3 obligation). NOTE the mechanical consequence: assess-all +
+  version bump rewrites the assessment columns of EVERY incident exactly once on the
+  first run - expected, not churn; say so in the run summary check.
+- Docs: docs/error-taxonomy.md restructured as TWO layers (the mirror's 20 + the engine
+  table's N; the pinned count tests in test/assessor-rules.test.js restructure with it);
+  docs/incidents-schema.md category note; PROMPTS/PHASE_LOG per FLOW.
+
+Non-goals:
+- NO edits to utils/classify/connection_regex.js (verbatim mirror - the point of the
+  design) and NO upstreaming into data_acquisition this phase (tracked open decision;
+  entries proven here are the future proposal).
+- NO fingerprint/normalize changes - FP_VERSION stays 1; zero incidents re-bucket.
+- NO L0 re-classification migration: existing error_events rows keep their stored
+  'unknown'. Active incidents converge via the newest-representative refresh within a
+  cron cycle or two (every high-volume family above recurs constantly); dormant/resolved
+  incidents keep the old category - accepted, count them in validation. This makes
+  MIXED-CATEGORY FINGERPRINTS REAL for the first time (old events 'unknown', new events
+  classified): the Phase 3 refresh caveat in utils/db/queries/incidents.js ("prefer a
+  confident category over 'unknown'") becomes live - verify newest-wins converges to the
+  new category and implement that caveat if any flap between unknown and classified
+  appears.
+- No state-machine or recovery-scope changes; no oracle changes; the error_type
+  corroboration follow-up (Phase 3) stays separately tracked.
+
+Expected files / layers:
+- utils/classify/engine_regexes.js (new), domain/classify.js (compose),
+  domain/assessor/rules.js (+ new-category branches, R1 rewrite, RULES_VERSION=2),
+  test/classify.test.js + test/assessor-rules.test.js (+ layer-precedence,
+  no-collision, per-family, restructured counts), docs.
+
+Expected validation:
+- node --test: layer precedence (a production match is NEVER shadowed by an engine
+  entry; engine consulted only on production miss); no-collision sweep (every production
+  pattern's known matching texts still classify identically); one test per family
+  asserting category + severity + reasons; count tests restructured; the interim-M2
+  reason string asserted ABSENT.
+- Live smoke: run assess -> every incident re-assessed once (assessor_version=2
+  everywhere); after 1-2 cron cycles the active unknown incidents converge to the new
+  categories (re-measure the unknown bucket - expect it to collapse to the residual +
+  dormant rows; COUNT the dormant stragglers); severity distribution re-measured and
+  compared against the per-family verdicts; parity PASS (category_in_own_l0 holds for
+  the new categories via fresh L0 events); state machine unaffected (recovery scope
+  unchanged; new-category incidents still close by staleness/recovery per their
+  producer).
+- Read the rows. Every phase has shipped a wiring defect invisible to node --test.
+
+Write-isolation / least-privilege / idempotency / determinism constraints:
+- classify stays PURE and deterministic (two ordered tables, first-match-wins, no I/O).
+  No new write surface, no new grant, no schema change expected (verify). Re-run stable
+  after the one-time version-bump rewrite.
+
+Schema assumptions to confirm live (Step 2):
+- Re-measure the family table above (cron-live; counts WILL have moved) and the
+  active-vs-dormant split per family.
+- Confirm zero category-slug collisions and zero pattern overlap with the production
+  table (the no-collision test is the durable form).
+- Confirm the newest-representative refresh converges incident.category for a
+  high-volume family within one cycle (pick JOB HALTED - it recurs every run).
+
+Review questions:
+- Is every family's severity verdict backed by QUOTED producer code (the F2 standard),
+  not by its label or its message text?
+- Can an engine entry ever shadow or reorder the production table's decisions?
+- Did the medium queue deflate because reality got more legible, or did we just relabel
+  (the Phase 4 review question, third asking)? Show the before/after distribution.
+- Is the residual `unknown` policy explicit, developer-decided, and free of "interim"
+  language? Is RULES_VERSION=2 stamped on every row?
+- What happens to a family we classified WRONG - how does a bad verdict get noticed and
+  reversed? (Answer should involve reasons carrying the producer evidence, and the
+  engine table being one reviewable file.)
