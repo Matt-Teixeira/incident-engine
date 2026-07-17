@@ -18,7 +18,7 @@ Prompt:
 `notes/phase_5_reevaluation.md`; committed `77df163`)
 
 Git Commit:
-Pending
+`8307bd5` (phase) + `1b32f61` (deploy boundary installed, post-merge) + `7785c8a` (close-out)
 
 Review Artifacts:
 
@@ -260,12 +260,14 @@ Deferred findings:
   pinned to the reviewed merge commit `8307bd5`; `.env` copied; the crontab's one line
   re-pointed (full backup at `~/crontab.backup.20260717-140908`; diff verified to be
   exactly that line before install). Proven by running the exact cron command from the
-  deploy worktree (exit 0, self-log written); the next :25 tick watched as confirmation.
+  deploy worktree (exit 0, self-log written); the next :25 tick CONFIRMED it (self-log
+  14:25:04, clean exit, a working run: 10 re-opens + 3 recovery closes).
   One incident during install: a mangled temp path made the first `crontab <file>`
   invocation fail — the existing crontab was verified untouched before retrying via a
   short path. From now on a `git checkout` in the dev tree touches nothing in production;
-  deploys are the two-command runbook in DEPLOYMENT.md §Deploy boundary. F3 ready for
-  final re-verdict.
+  deploys are the two-command runbook in DEPLOYMENT.md §Deploy boundary. **Final verdict
+  received: F1 closed, F2 closed, F3 CLOSED (post-deploy smoke passed) — Phase 5 fully
+  closed.**
 
 ## Problems Encountered
 
