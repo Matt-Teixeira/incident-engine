@@ -128,7 +128,15 @@ Good first targets / correctness checks:
 Recorded here so they survive outside chat. Status as of 2026-07-21, post-integration
 (ops-dashboard branch `phase-19-incidents-view`, close-out `9c2b93b`).
 
-### FU-1 — `error_events (fingerprint, entity, dt DESC)` composite index (ACCEPTED, pending a cycle)
+### FU-1 — `error_events (fingerprint, entity, dt DESC)` composite index (DONE 2026-07-21 — REPLACED)
+
+**Resolved: REPLACE.** Applied live + in `db/schema.sql` (idempotent DROP old + CREATE
+composite). The old `(fingerprint, dt DESC)` index's only consumers are the parity script's
+equality filters (no dt ordering), which the composite serves identically; production never
+filters persisted error_events by fingerprint. Drill-down 1,748 ms cold → ~1.5 ms; parity
+PASS; net index count unchanged. Planner-transparent — ops-dashboard unaffected. Details in
+`markdown/PHASE_LOG.md` (Schema Maintenance — FU-1). Original analysis below, kept for record:
+
 
 The dashboard's per-incident drill-down (`WHERE fingerprint=$1 AND entity=$2 ORDER BY dt
 DESC LIMIT n`) is served today only by `idx_error_events_fingerprint_dt (fingerprint, dt

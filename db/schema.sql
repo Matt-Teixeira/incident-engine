@@ -57,7 +57,16 @@ CREATE TABLE IF NOT EXISTS incidents.error_events(
 
 CREATE INDEX IF NOT EXISTS idx_error_events_inserted_brin ON incidents.error_events USING BRIN(inserted_at);
 
-CREATE INDEX IF NOT EXISTS idx_error_events_fingerprint_dt ON incidents.error_events(fingerprint, dt DESC);
+-- (fingerprint, entity, dt DESC): serves the ops-dashboard per-incident drill-down
+-- (WHERE fingerprint=? AND entity=? ORDER BY dt DESC LIMIT n) as an ORDERED index scan
+-- that respects the LIMIT — the worst-case incident (45k events) went 1,748 ms cold → ~1.5 ms.
+-- SUPERSEDES the former (fingerprint, dt DESC): its only consumers are the parity script's
+-- fingerprint / (fingerprint, entity) EQUALITY filters (no dt ordering), which the leading
+-- columns of this composite serve identically. Idempotent DROP so re-applying schema.sql on a
+-- live DB retires the old index (2026-07-21, integration follow-up FU-1; ADD-vs-REPLACE
+-- resolved to REPLACE — ops-dashboard confirmed indifferent, no fingerprint-only dt-ordered query exists).
+DROP INDEX IF EXISTS incidents.idx_error_events_fingerprint_dt;
+CREATE INDEX IF NOT EXISTS idx_error_events_fingerprint_entity_dt ON incidents.error_events(fingerprint, entity, dt DESC);
 
 CREATE INDEX IF NOT EXISTS idx_error_events_sme_dt ON incidents.error_events(sme, dt DESC) WHERE sme IS NOT NULL;
 

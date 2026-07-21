@@ -5,6 +5,42 @@ Durable memory of what's been done and why. Newest entry at the top. Add an entr
 
 ---
 
+# Schema Maintenance — FU-1: error_events drill-down index (integration follow-up)
+
+Date: 2026-07-21
+
+Status: Completed (live-applied + validated; deploy-worktree synced)
+
+Trigger: the ops-dashboard integration (its `phase-19-incidents-view`) surfaced that the
+per-incident drill-down (`WHERE fingerprint=? AND entity=? ORDER BY dt DESC LIMIT n`) was
+served only by `idx_error_events_fingerprint_dt (fingerprint, dt DESC)`, which forces a
+bitmap scan that fetches ALL matching rows then sorts — ignoring the LIMIT. The decision
+was handed to incident-engine as schema owner (`notes/ops_dashboard_integration_brief.md`
+FU-1).
+
+Change: **REPLACE** `(fingerprint, dt DESC)` with `(fingerprint, entity, dt DESC)`
+(`idx_error_events_fingerprint_entity_dt`), idempotent DROP + CREATE in `db/schema.sql`.
+
+Evidence (Step-2 live, worst-case incident = 45,509 events):
+- Drill-down: bitmap-fetch-all-then-sort **1,748 ms cold** → ordered index scan that stops
+  at the LIMIT **~1.5 ms** (verified live, real not rolled-back).
+- **ADD vs REPLACE → REPLACE.** The old index's only consumers are the parity script's
+  correlated subqueries (`assess_parity.js`): `count(DISTINCT type)` / `min(type)` filtered
+  by `fingerprint` alone, and an `EXISTS` on `(fingerprint, entity)` — all EQUALITY filters
+  with NO dt ordering, so the composite's leading columns serve them identically (proven by
+  EXPLAIN with the old index dropped: the fingerprint-only subquery bitmap-scans the
+  `fingerprint` prefix exactly as before). Production runtime never filters persisted
+  error_events by fingerprint (aggregate uses the inserted_at watermark range; representative
+  selection runs over the in-flight batch CTE). ops-dashboard confirmed indifferent (its
+  drill-down always filters both columns). Net index count unchanged (5).
+
+Validation: `db/schema.sql` re-applies idempotently (2nd apply: DROP skips already-gone,
+CREATE skips present, exit 0); live drill-down confirmed on the composite; `assess_parity.js`
+**PASS** (528 incidents, all v2, fingerprint subqueries correct). No code/logic change — the
+planner picks the index transparently, so ops-dashboard needs nothing.
+
+---
+
 # Phase 6 — Engine Classifier Layer: Classify the Unknowns
 
 Date:
