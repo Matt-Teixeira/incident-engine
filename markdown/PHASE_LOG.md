@@ -5,7 +5,36 @@ Durable memory of what's been done and why. Newest entry at the top. Add an entr
 
 ---
 
-# Schema Maintenance — FU-1: error_events drill-down index (integration follow-up)
+# Infra — Migration to the fleet dev/release paradigm
+
+Date: 2026-08-26
+
+Status: Completed (cutover verified over two cron cycles)
+
+The third app (after data_acquisition 2026-08-24 and monday 2026-08-25) migrated to the
+paradigm in `data_acquisition/docs/migration_CLAUDE.md`. Commits `b63bf3e`..`0309687`:
+banner → own image/entrypoint/build.sh → build-release.sh + RELEASE_SHA provenance →
+logger conform (fail-safe `LOG_DIR`, `USER_ID` tag, `LOGGER_MODE`; retired
+`RUN_ENV`/`RUN_LOGS_DIR`/`LOGGER`, whose unset default was the PRODUCTION log path) →
+SIGTERM/SIGINT flush-once handlers (real kill test: ERROR event, both sinks, exit 1) →
+preflight-check.sh → docs conform.
+
+Topology change: the editable clone moved to `~/apps/incident-engine`;
+`/opt/apps/incident-engine` (previously the primary git repo) is now release output
+produced only by `build-release.sh`; the `/opt/apps/incident-engine-deploy` worktree
+(Phase 5 review F3's deploy boundary) and the `/opt/resources/node_mod_cache` mount were
+retired — build-release.sh now provides the same guarantee (cron never runs a mutable
+tree) plus the clean-tree guard and `RELEASE_SHA` provenance the worktree lacked.
+
+Cutover evidence: release `0309687` — preflight 38 ok / 0 warnings from both copies;
+dev round-trip in-tree with `dev-tree` provenance and nothing in `/opt/run-logs`;
+dirty-tree release refused; scheduled runs 16:55:02 and 17:25:03 UTC on `0309687`,
+zero warn/errors, `events=7` — identical profile to the 8-day pre-migration baseline
+(48 runs/day at :25/:55, zero warn/errors). Cron entry hardened in place (user crontab,
+cadence unchanged; svc-crontab consolidation stays data_acquisition BACKLOG 6f).
+
+Open follow-up: register both `.env` copies with the host rotation script for
+`PGPASSWORD` (owner action; the app was never registered).
 
 Date: 2026-07-21
 
