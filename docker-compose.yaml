@@ -1,23 +1,34 @@
 # incident-engine — cron-batch one-shot (no server, no published port).
 # Invoke: docker compose run --rm app node index.js <materialize|assess|run>
+#   dev:     RUN_USER=<you> docker compose run --rm app node index.js <job>
+#   release: omit RUN_USER — docker/entrypoint.sh defaults to svc.
 services:
   app:
-    image: node:lts
-    user: "105:987"
+    image: incident-engine:${USER_ID}
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args:
+        USER_ID: ${USER_ID}
+        DOCKER_GID: ${DOCKER_GID}
+        UID_0: ${UID_0}
+        UID_1: ${UID_1}
+        UID_2: ${UID_2}
     working_dir: /workspace
     env_file:
       - .env
     environment:
-      # Don't write into root's $HOME inside the image; use a tmp home
-      HOME: /tmp
+      # Intentionally unset in .env — empty means the entrypoint defaults to
+      # svc; dev runs pass it on the CLI. The :- silences the compose warning.
+      RUN_USER: ${RUN_USER:-}
       # Keep npm's cache ephemeral (avoids permission issues on bind mounts)
       NPM_CONFIG_CACHE: /tmp/.npm
     volumes:
-      # Project source → live edit on host reflects in container
+      # Project source (incl. in-tree node_modules) → live edit on host
       - ./:/workspace
-      # node_modules cache
-      - /opt/resources/node_mod_cache/incident-engine:/workspace/node_modules
       # Centralized run logs (host:container bind spec, set in .env)
+      # TODO(migration): replaced by ${LOG_DIR:-./utils/logger/logs} in the
+      # logger-conform commit — do not build new behavior on RUN_LOGS_DIR.
       - ${RUN_LOGS_DIR}
       # Shared PG SSL cert (read-only), for PG_SSLMODE=verify-*
       - /opt/resources/ssl:/opt/resources/ssl:ro
