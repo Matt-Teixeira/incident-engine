@@ -2,6 +2,26 @@
 
 Orientation for an AI assistant (or new contributor) picking this project up cold.
 
+> ## ⚠ MID-MIGRATION (started 2026-08-26)
+>
+> This app is being migrated to the fleet dev/release paradigm — the same migration
+> `data_acquisition` (pilot, 2026-08-24) and `monday` (2026-08-25) completed. The spec is
+> `/opt/apps/data_acquisition/docs/migration_CLAUDE.md` (Part 1 = conventions, Part 3 =
+> checklist); `~/apps/data_acquisition` and `~/apps/monday` are the reference
+> implementations. **Until this banner is removed, sections of this file and of
+> `markdown/DEPLOYMENT.md` may describe the PRE-migration state** (deploy worktree,
+> stock `node:lts` image, `user: "105:987"` pin, `RUN_ENV`/`RUN_LOGS_DIR`/`LOGGER` env
+> keys). Where this file disagrees with the migration spec, the spec wins. Sections are
+> corrected in the commit that makes them true.
+>
+> Target state: editable clone at `~/apps/incident-engine`; `/opt/apps/incident-engine`
+> is release output produced only by `build-release.sh`; own image
+> `incident-engine:${USER_ID}` (dev) / `incident-engine:svc` (release) with a gosu
+> entrypoint; logs via `${LOG_DIR:-./utils/logger/logs}` failing safe to the dev path;
+> `RELEASE_SHA` provenance in every run's boot note; hardened cron entry at the
+> unchanged :25/:55 cadence. The `/opt/apps/incident-engine-deploy` worktree is retired
+> at cutover.
+
 ## What this project is
 
 `incident-engine` is a **deterministic error→incident pipeline** for the cron-driven
