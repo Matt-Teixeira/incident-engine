@@ -95,12 +95,29 @@ rewrite:
 - **DB:** `pg-promise` with env fallback chains (`process.env.PGHOST || process.env.PG_HOST`),
   SSL via `PG_SSLMODE`/`PG_SSL_PATH`. Writes via `pgp.helpers` ColumnSets (parameterized),
   never hand-rolled string SQL.
+- **Image:** own image `incident-engine:${USER_ID}` (dev = your username, release = `svc`)
+  built from `docker/Dockerfile` — node:lts + gosu, docker group + svc/dev users from
+  no-default build ARGs, baked `docker/entrypoint.sh` (defaults `RUN_USER` to svc, repairs
+  a root-owned log dir before dropping privileges). Deps are in-tree `node_modules` via
+  `build.sh` (the `/opt/resources/node_mod_cache` mount is retired).
+- **Logs:** container path is always `utils/logger/logs/`; the compose mount
+  `${LOG_DIR:-./utils/logger/logs}` decides the host side — unset FAILS SAFE to the dev
+  tree, the release copy points at `/opt/run-logs/incident-engine` via `#RELEASE:LOG_DIR`.
+  Filename tag is `${USER_ID}`; `LOGGER_MODE` (`log`/`log_and_console`) gates console
+  output. (`RUN_ENV`, `RUN_LOGS_DIR`, `LOGGER` are retired.)
+- **Provenance:** `build-release.sh` stamps `RELEASE_SHA` into the deployed `.env`;
+  every boot logs it in the `env_note` (and on stdout), `dev-tree` when unset. A scheduled
+  run showing `dev-tree` means cron is running the wrong copy.
 - **DDL:** house style — `BIGSERIAL` PK, `TIMESTAMPTZ DEFAULT NOW()`, BRIN on time columns,
   **no table partitioning** (mirror `stats.acquisition_history`).
 - **Dispatch:** `node index.js <job>` via a `switch` in `index.js`.
-- **Deploy:** cron-**batch** one-shot in Docker on `pg_net` (`docker compose run --rm app
-  node index.js <job>`) — **not** a long-running service. Run as `user: "105:987"`,
-  `node_modules` from `/opt/resources/node_mod_cache/incident-engine`.
+- **Deploy:** cron-**batch** one-shot in Docker on `pg_net` — **not** a long-running
+  service. The editable clone lives at `~/apps/incident-engine`;
+  `/opt/apps/incident-engine` is release output produced ONLY by `build-release.sh`
+  (clean-tree guard, `#RELEASE:` overrides, `RELEASE_SHA` stamp). Dev:
+  `RUN_USER=<you> docker compose run --rm app node index.js <job>` from the clone.
+  Production: same command from `/opt/apps/incident-engine` with `RUN_USER` omitted
+  (entrypoint defaults to svc). See `markdown/DEPLOYMENT.md`.
 
 ## Working agreement
 

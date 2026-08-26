@@ -6,8 +6,17 @@ pipeline (and unlike `ops-dashboard`, which is a long-running service). Each run
 is **no server and no published port**. See the Deployment Rule in
 `ARCHITECTURE_PRINCIPLES.md`.
 
-> This runbook is the target shape; the concrete `docker-compose.yaml`, `package.json`
-> scripts, and cron entries are created in **Phase 1**. Until then this documents intent.
+Since the 2026-08 migration this app follows the **fleet dev/release paradigm**
+(`data_acquisition/docs/migration_CLAUDE.md` Part 1):
+
+- **Dev tree** = the editable clone `~/apps/incident-engine`. Image
+  `incident-engine:<your-username>`, runs as you (`RUN_USER=<you>`), logs land in-tree
+  (`./utils/logger/logs`, gitignored), boot note records `RELEASE_SHA=dev-tree`.
+- **Release copy** = `/opt/apps/incident-engine`, produced ONLY by `bash build-release.sh`
+  from a clean, pushed dev tree. Image `incident-engine:svc`, runs as `svc` (entrypoint
+  default — omit `RUN_USER`), logs to `/opt/run-logs/incident-engine`, boot note records
+  the stamped `RELEASE_SHA`.
+- `bash preflight-check.sh` validates either copy — expect **zero warnings**.
 
 ## One-time provisioning (superuser)
 
@@ -39,25 +48,39 @@ the grant surface.
 | `assess` | L1/L2/L3/L5: aggregate → `incidents.incidents`, deterministically assess, run the state machine + auto-close. |
 | `run` | `materialize` then `assess` in one process (the normal cron invocation). |
 
-Invocation (host, in the app dir):
+Invocation (host):
 
 ```bash
+# dev tree (~/apps/incident-engine) — run as yourself
+RUN_USER=$(id -un) docker compose run --rm app node index.js run
+# release copy (/opt/apps/incident-engine) — omit RUN_USER, entrypoint defaults to svc
 docker compose run --rm app node index.js run
 ```
 
-The app runs as `user: "105:987"` on the external `pg_net` network, with `node_modules`
-bind-mounted from `/opt/resources/node_mod_cache/incident-engine`.
+The app runs its own image `incident-engine:${USER_ID}` on the external `pg_net`
+network; `docker/entrypoint.sh` drops to the target user via gosu. `node_modules` is
+in-tree, installed by `build.sh` (the shared `/opt/resources/node_mod_cache` is retired
+for this app).
 
 ## Cadence (decided 2026-07-16, after Phase 3)
 
-**One** cron line calling `run`, half-hourly at **:25/:55** — installed in the host crontab:
+**One** cron line calling `run`, half-hourly at **:25/:55** — a hardened entry in
+matt-teixeira's user crontab (this host's job apps historically live there; consolidation
+into the shared svc crontab is data_acquisition BACKLOG 6f, a separate follow-up):
 
 ```cron
-25,55 * * * * cd /opt/apps/incident-engine-deploy && docker compose run --rm app node index.js run
+# ---------------- INCIDENT ENGINE (hardened 2026-08-26; runs release copy as svc) ----------------
+25,55 * * * * cd /opt/apps/incident-engine && /usr/bin/flock -n /tmp/incident-engine.run.lock /usr/bin/docker compose run --rm -T app node index.js run >/opt/run-logs/incident-engine/cron.run.out 2>&1
 ```
 
-(The directory is the DEPLOY WORKTREE since 2026-07-17 — see "Deploy boundary" below. From
-2026-07-16 to 2026-07-17 it was `/opt/apps/incident-engine`, the mutable dev tree.)
+Hardening notes: absolute `/usr/bin/docker` + `/usr/bin/flock` (cron's PATH is minimal);
+`-T` (no TTY under cron); `flock -n` skips a tick rather than queueing (overlap is already
+serialized DB-side by the `pipeline_state` row lock — the flock is belt-and-braces);
+single-`>` bounded `.out` file whose first line is the boot provenance line
+(`[incident-engine] job=run release_sha=<sha>`), catching failures that happen before
+node starts and therefore reach neither log sink. `RUN_USER` and `HOME` are deliberately
+NOT set. (Pre-migration the entry ran unhardened from the retired
+`/opt/apps/incident-engine-deploy` worktree with output to the mail spool.)
 
 Why one line, not two staggered ones: `materialize` and the `assess` aggregate **serialize on
 a shared watermark row lock** (`pipeline_state['util.app_run_logs']` — see
@@ -74,24 +97,34 @@ load. Steady-state a `run` is ~4–7s (~116ms when the window is empty). Trade-o
 `58,28` stragglers wait until the next run (~27 min).
 
 The `cd` prefix is required — cron runs from `$HOME`, and `docker compose` without it fails
-with "no configuration file provided". Match the suite's existing lines.
+with "no configuration file provided".
 
-Output is not redirected (matching the rest of the suite), so run output lands in the cron
-mail spool; the app's real observability is its self-log row in `util.app_run_logs`
-(`app_name = 'incident-engine'`) and the per-run JSON in `/opt/run-logs/incident-engine/`.
-A non-zero exit means the batch failed (see the exit-code rule in `PHASE_LOG.md` Phase 1).
+Observability: the self-log row in `util.app_run_logs` (`app_name = 'incident-engine'`,
+boot note carries `RELEASE_SHA`), the per-run JSON in `/opt/run-logs/incident-engine/`,
+and `cron.run.out` for anything that dies before node starts. A non-zero exit means the
+batch failed (see the exit-code rule in `PHASE_LOG.md` Phase 1); a SIGTERM/SIGINT kill
+also flushes both sinks and exits 1 (flush-once handlers in `index.js`).
 
 ## Smoke test (after a job/schema/role change)
 
 ```bash
 # unit tests (pure domain logic)
-docker run --rm -v "$PWD":/w -w /w node:lts node --test
+docker run --rm -v "$PWD":/w -w /w --user "$(id -u):$(id -g)" node:lts node --test
+
+# lifecycle smoke: boot → self-log insert → log file → exit 0
+RUN_USER=$(id -un) docker compose run --rm app node index.js noop
 
 # materialize a narrow window, then assess; re-run to prove idempotency
-docker compose run --rm app node index.js materialize
-docker compose run --rm app node index.js assess
-docker compose run --rm app node index.js assess   # re-run: counts advance, no duplicate incidents
+# (from the dev tree these advance the REAL watermark — that is safe by
+# design: idempotent, and serialized against a concurrent cron run by the
+# pipeline_state row lock. The runs self-log with RELEASE_SHA=dev-tree.)
+RUN_USER=$(id -un) docker compose run --rm app node index.js materialize
+RUN_USER=$(id -un) docker compose run --rm app node index.js assess
+RUN_USER=$(id -un) docker compose run --rm app node index.js assess   # re-run: counts advance, no duplicate incidents
 ```
+
+From the release copy, run the same commands in `/opt/apps/incident-engine` with
+`RUN_USER` omitted.
 
 Verify against the DB (as a superuser or the role):
 
@@ -103,31 +136,33 @@ Verify against the DB (as a superuser or the role):
 - the self-log identity is DB-enforced:
   `INSERT INTO util.incident_engine_self_log(app_name, ...) VALUES ('data_acquisition', ...);  -- expect: check option violation`
 
-## Deploy boundary (Phase 5 review F3 — INSTALLED 2026-07-17)
+## Deploy boundary (fleet paradigm — replaced the deploy worktree 2026-08-26)
 
-The cron runs from a **dedicated deployment worktree**, `/opt/apps/incident-engine-deploy`,
-pinned to a reviewed commit (installed at `8307bd5`, Phase 5). The dev tree
-(`/opt/apps/incident-engine`) keeps its compose mount for development and smoke tests, but
-checking out a branch there no longer touches production. Before this (Phases 3–5
-development), the cron executed the mutable dev tree — a `git checkout` was an accidental
-deploy, and both Phase 4 and Phase 5 branch code ran in production before review.
+The deploy boundary is **`build-release.sh`**: cron runs the release copy
+`/opt/apps/incident-engine`, which only that script (run from a **clean, pushed** dev
+tree) can replace — a `git checkout` in the clone never touches production.
 
 **Per deploy** (after a phase is reviewed, committed, merged, and pushed):
 
 ```bash
-git -C /opt/apps/incident-engine-deploy fetch origin
-git -C /opt/apps/incident-engine-deploy checkout <reviewed-sha>
-# re-apply db/schema.sql FIRST if the phase changed it, then smoke per this runbook
+cd ~/apps/incident-engine
+# re-apply db/schema.sql FIRST if the phase changed it (as superuser), then:
+bash build-release.sh          # refuses a dirty tree; stamps RELEASE_SHA
+cd /opt/apps/incident-engine && bash preflight-check.sh   # expect zero warnings
+docker compose run --rm app node index.js noop            # release smoke as svc
 ```
 
-Notes: no root needed — the cron line lives in the operating user's crontab and
-`/opt/apps` is docker-group-writable. `.env` is gitignored and was COPIED (not linked)
-into the worktree; if credentials rotate, update both copies. Rollback = point the
-crontab line back at a previous SHA (or, worst case, the dev tree).
+History: from 2026-07-17 to 2026-08-26 the deploy boundary was a git worktree,
+`/opt/apps/incident-engine-deploy`, pinned to a reviewed SHA (Phase 5 review F3); before
+that the cron executed the mutable dev tree, where a `git checkout` was an accidental
+deploy. The worktree was retired at the paradigm cutover — same guarantee, one deploy
+mechanism fleet-wide, plus the clean-tree guard and `RELEASE_SHA` provenance the worktree
+never had. Credentials rotate in BOTH `.env` copies (clone + release).
 
 ## Rollback
 
 Batch jobs are stateless between runs (state lives in `incidents.*` + the watermark).
-To roll back code, redeploy the previous commit; data written by a bad run is idempotent
-and can be corrected by a re-run once the code is fixed. Schema changes roll back via a
-reverse migration applied as a superuser.
+To roll back code: `git checkout <previous-sha>` in the clone (or revert), then
+`bash build-release.sh` — the stamp keeps `util.app_run_logs` honest about what ran.
+Data written by a bad run is idempotent and can be corrected by a re-run once the code
+is fixed. Schema changes roll back via a reverse migration applied as a superuser.

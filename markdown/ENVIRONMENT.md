@@ -10,8 +10,12 @@ copy-pasteable template.
 | Var | Purpose |
 | --- | --- |
 | `APP_NAME` | Identity for self-logging into `util.app_run_logs`. **Must be `incident-engine`** — `index.js` fails boot on a mismatch, and the DB-side check-option view rejects any other value. |
-| `LOGGER` | Logger tag in the run-log filename (`${APP_NAME}-log.${LOGGER}.${run_id}.json`). Mirrors `data_acquisition`. |
-| `RUN_LOGS_DIR` | Where per-run JSON logs are written (e.g. `/opt/run-logs/incident-engine`). The host dir must be writable by `105:987`. |
+| `USER_ID` | Triple duty (fleet convention): image tag (`incident-engine:${USER_ID}`), run-log filename tag (`${APP_NAME}-log.${USER_ID}.${run_id}.json`), boot-note label. Dev = your username; release = `svc` via `#RELEASE:USER_ID=svc`. |
+| `LOGGER_MODE` | `log` (file only, the release value) or `log_and_console` (adds error stacks + first/last event stats — the dev value). |
+| `LOG_DIR` | **Host** side of the run-log mount; code always writes the container path `utils/logger/logs/`. Unset/dev = `./utils/logger/logs` (fails safe, in-tree, gitignored); release = `/opt/run-logs/incident-engine` via `#RELEASE:LOG_DIR`. |
+| `DOCKER_GID` / `UID_0` / `UID_1` / `UID_2` | Host identity build args for the image (docker group gid; svc / jonathan-pope / matt-teixeira uids). Per-server — read from the host, never copied between servers. |
+| `RELEASE_SHA` | **Injected by `build-release.sh` into the deployed `.env` only — never set by hand.** Boot logs it in the `env_note` (`dev-tree` when absent), so every `util.app_run_logs` row records its commit. |
+| ~~`LOGGER`~~ ~~`RUN_ENV`~~ ~~`RUN_LOGS_DIR`~~ | **Retired 2026-08-26** (paradigm migration). `RUN_ENV`'s unset default was the *production* log path — fail-unsafe; preflight warns if any of these reappear. |
 | `PGHOST` / `PG_HOST` | DB host. In-suite: `pg_db`. (`PGHOST` is tried first, then `PG_HOST`.) |
 | `PGPORT` / `PG_PORT` | DB port (`5432`). |
 | `PGDATABASE` / `PG_DB` | DB name (`staging`). |
