@@ -99,15 +99,26 @@ const onBoot = async () => {
   try {
     run_log = await makeAppRunLog();
 
+    // Release provenance: build-release.sh stamps RELEASE_SHA into the
+    // DEPLOYED .env; a dev tree has no key and records 'dev-tree'. This note
+    // rides in every util.app_run_logs row, so every run identifies the
+    // commit that produced it. A scheduled run showing 'dev-tree' means cron
+    // is running the wrong copy.
     let note = {
       LOGGER: process.env.LOGGER,
       PG_USER: process.env.PGUSER || process.env.PG_USER,
       PG_DB: process.env.PGDATABASE || process.env.PG_DB,
+      RELEASE_SHA: process.env.RELEASE_SHA || "dev-tree",
     };
 
     await addLogEvent(I, run_log, "onBoot", cal, note, null);
 
     const job = process.argv[2] || "run";
+    // Same fact on stdout: line 1 of the cron .out file, for failures the DB
+    // row can't record and for eyeballing a run without a DB query.
+    console.log(
+      `[incident-engine] job=${job} release_sha=${process.env.RELEASE_SHA || "dev-tree"}`
+    );
     run_log.run_group = job;
 
     await runJob(run_log, job);
