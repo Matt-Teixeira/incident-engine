@@ -142,5 +142,7 @@ vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
 
-# per-run dev log files written by utils/logger (RUN_ENV=dev)
+# per-run dev log files written by utils/logger — current location (LOG_DIR
+# unset → in-tree logs/ dir) and the pre-migration RUN_ENV=dev location
+utils/logger/logs/
 utils/logger/*.json

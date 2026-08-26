@@ -14,18 +14,13 @@ let write_stream_error;
 const makeAppRunLog = async () => {
   const run_id = uuidv4();
 
-  switch (process.env.RUN_ENV) {
-    case "dev":
-      path = `./utils/logger/${process.env.APP_NAME}-log.${process.env.LOGGER}.${run_id}.json`;
-      break;
-
-    case "staging":
-      path = `/opt/run-logs/${process.env.APP_NAME}/${process.env.APP_NAME}-log.${process.env.LOGGER}.${run_id}.json`;
-      break;
-    default:
-      path = `/opt/run-logs/${process.env.APP_NAME}/${process.env.APP_NAME}-log.${process.env.LOGGER}.${run_id}.json`;
-      break;
-  }
+  // Single container-fixed path (fleet convention, matches data_acquisition).
+  // WHERE this lands on the host is the compose LOG_DIR mount's decision (dev
+  // tree by default, /opt/run-logs/<app> in a release), so a missing variable
+  // fails SAFE into the dev tree instead of writing into the production
+  // record. Replaces the retired RUN_ENV switch, whose unset default was the
+  // production path — fail-unsafe.
+  path = `./utils/logger/logs/${process.env.APP_NAME}-log.${process.env.USER_ID}.${run_id}.json`;
 
   write_stream = fs.createWriteStream(path, {
     flags: "a",
@@ -66,7 +61,7 @@ const addLogEvent = async (type, run_log, func, tag, note, err) => {
       err?.stack ?? (err == null ? "Unknown error" : String(err));
 
     // CONSOLE LOG ERROR TO DEV
-    if (process.env.LOGGER === "dev") {
+    if (process.env.LOGGER_MODE === "log_and_console") {
       console.log(log_event.err_msg);
     }
   }
@@ -285,7 +280,7 @@ const writeLogEvents = async (run_log) => {
   }
 
   // PROVIDE BASIC DEV STATS
-  if (process.env.LOGGER === "dev") {
+  if (process.env.LOGGER_MODE === "log_and_console") {
     console.log(`\nFIRST LOG EVENT: ${JSON.stringify(log_events[0])}`);
     console.log(
       `LAST LOG EVENT: ${JSON.stringify(log_events[log_events.length - 1])}\n`

@@ -105,7 +105,8 @@ const onBoot = async () => {
     // commit that produced it. A scheduled run showing 'dev-tree' means cron
     // is running the wrong copy.
     let note = {
-      LOGGER: process.env.LOGGER,
+      USER_ID: process.env.USER_ID,
+      LOGGER_MODE: process.env.LOGGER_MODE,
       PG_USER: process.env.PGUSER || process.env.PG_USER,
       PG_DB: process.env.PGDATABASE || process.env.PG_DB,
       RELEASE_SHA: process.env.RELEASE_SHA || "dev-tree",

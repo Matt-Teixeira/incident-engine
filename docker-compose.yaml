@@ -26,10 +26,11 @@ services:
     volumes:
       # Project source (incl. in-tree node_modules) → live edit on host
       - ./:/workspace
-      # Centralized run logs (host:container bind spec, set in .env)
-      # TODO(migration): replaced by ${LOG_DIR:-./utils/logger/logs} in the
-      # logger-conform commit — do not build new behavior on RUN_LOGS_DIR.
-      - ${RUN_LOGS_DIR}
+      # Run-log output — path depends on environment. Dev tree: LOG_DIR unset
+      # → FAILS SAFE to the in-tree dev path. Release copy: #RELEASE:LOG_DIR
+      # points it at /opt/run-logs/incident-engine (svc-owned production
+      # history). Code always writes the container path.
+      - ${LOG_DIR:-./utils/logger/logs}:/workspace/utils/logger/logs
       # Shared PG SSL cert (read-only), for PG_SSLMODE=verify-*
       - /opt/resources/ssl:/opt/resources/ssl:ro
     networks:
