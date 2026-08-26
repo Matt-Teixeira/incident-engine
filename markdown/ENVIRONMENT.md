@@ -39,5 +39,15 @@ copy-pasteable template.
   same for port/db/user/password), mirroring `data_acquisition/utils/db/pg-pool.js`.
 - **Secrets:** only variable **names** appear here and in prompts. Values live only in the
   gitignored `.env`.
+- **Password rotation (verified 2026-08-26):** the host rotation script
+  (`/opt/resources/scripts/rotate-envs-20260817.sh`) rotates the **PG superuser**
+  password and matches on that value — this app's `PGPASSWORD` is `incident_engine_rw`'s
+  own, so a listing there would be **inert** (the app is deliberately absent; same
+  finding as reports). This app's rotation path: update root-only
+  `/root/incident_engine_rw_pw`, re-run `db/setup-owner-role.sql` as superuser (it sets
+  the role password from `-v pw=...`), then update `PGPASSWORD` in **both** `.env`
+  copies (`~/apps/incident-engine` + `/opt/apps/incident-engine`) by hand.
+  `bash preflight-check.sh` proves the result (authenticated sibling-container check —
+  a stale value fails loudly there, never silently).
 - **Self-log identity:** `APP_NAME` must stay `incident-engine` so self-logged runs are
   attributable and never collide with another app's rows.
