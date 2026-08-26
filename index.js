@@ -91,6 +91,64 @@ async function runJob(run_log, job) {
   }
 }
 
+// --- Finalization (shared by the normal exit path and the signal handlers) ---
+// Both sinks are required: a run whose self-log insert or log-file write
+// failed must exit non-zero so cron sees it, even when the job itself
+// succeeded. Each sink reports failure instead of throwing, so one failing
+// sink never blocks the other. `finalizing` is the once-guard: whichever path
+// gets there first (normal completion or a signal) flushes; the other no-ops.
+let active_run_log = null;
+let finalizing = false;
+
+const finalizeRun = async (run_log, failed) => {
+  let ok = !failed;
+  if (run_log) {
+    await addRunSummary(run_log);
+    const db_ok = await dbInsertLogEvents(pgp, run_log);
+    const file_ok = await writeLogEvents(run_log);
+    if (!db_ok || !file_ok) ok = false;
+  }
+  // Batch one-shot: release the pool so the process exits promptly instead
+  // of waiting out the idle-connection timeout.
+  try {
+    await db.$pool.end();
+  } catch (error) {
+    console.log(error);
+    ok = false;
+  }
+  return ok;
+};
+
+// A killed run must still produce both sinks and an honest non-zero exit —
+// without this, docker stop / a cron timeout leaves no log file and no
+// util.app_run_logs row, zero diagnostics exactly when they matter. gosu
+// execs node as PID 1, so the signal arrives here directly. The 5s race
+// bounds the flush when the DB itself is the thing that is broken.
+const onSignal = async (signal) => {
+  if (finalizing) return;
+  finalizing = true;
+  console.error(
+    `[incident-engine] ${signal} received — flushing log sinks before exit`
+  );
+  if (active_run_log) {
+    await addLogEvent(
+      E,
+      active_run_log,
+      "onSignal",
+      cat,
+      { signal },
+      new Error(`${signal} received — run killed before completion`)
+    );
+  }
+  await Promise.race([
+    finalizeRun(active_run_log, true),
+    new Promise((resolve) => setTimeout(resolve, 5000)),
+  ]);
+  process.exit(1);
+};
+process.on("SIGTERM", () => onSignal("SIGTERM"));
+process.on("SIGINT", () => onSignal("SIGINT"));
+
 const onBoot = async () => {
   console.time("App Run Time");
   let run_log;
@@ -98,6 +156,7 @@ const onBoot = async () => {
 
   try {
     run_log = await makeAppRunLog();
+    active_run_log = run_log;
 
     // Release provenance: build-release.sh stamps RELEASE_SHA into the
     // DEPLOYED .env; a dev tree has no key and records 'dev-tree'. This note
@@ -129,27 +188,13 @@ const onBoot = async () => {
     if (run_log) await addLogEvent(E, run_log, "onBoot", cat, null, error);
   }
 
-  // Single finalization path. Both sinks are required: a run whose self-log
-  // insert or log-file write failed must exit non-zero so cron sees it, even
-  // when the job itself succeeded. Each sink reports failure instead of
-  // throwing, so one failing sink never blocks the other.
-  if (run_log) {
-    await addRunSummary(run_log);
-    const db_ok = await dbInsertLogEvents(pgp, run_log);
-    const file_ok = await writeLogEvents(run_log);
-    if (!db_ok || !file_ok) failed = true;
+  // Normal-completion finalization; a signal that arrived first already
+  // flushed (and exited), so respect the once-guard.
+  if (!finalizing) {
+    finalizing = true;
+    const ok = await finalizeRun(run_log, failed);
+    if (!ok) process.exitCode = 1;
   }
-
-  // Batch one-shot: release the pool so the process exits promptly instead
-  // of waiting out the idle-connection timeout.
-  try {
-    await db.$pool.end();
-  } catch (error) {
-    console.log(error);
-    failed = true;
-  }
-
-  if (failed) process.exitCode = 1;
   console.log("\n********** END **********");
   console.timeEnd("App Run Time");
 };
