@@ -58,7 +58,7 @@ WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'incident_engine_rw')
 ALTER ROLE incident_engine_rw LOGIN PASSWORD :'pw'
   NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS INHERIT;
 
-GRANT CONNECT ON DATABASE staging TO incident_engine_rw;
+GRANT CONNECT ON DATABASE dev TO incident_engine_rw;
 
 -- ---------------------------------------------------------------------------
 -- OWNED SCHEMA: incidents. Ownership (not grants) is the mechanism — the app
