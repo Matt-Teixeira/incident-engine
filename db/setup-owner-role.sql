@@ -2,7 +2,7 @@
 -- One-time setup of the least-privilege role incident-engine connects as.
 -- Run AFTER db/schema.sql, as a superuser, against the database that holds
 -- util.app_run_logs (see markdown/DEPLOYMENT.md):
---   docker exec -i pg_db psql -U postgres -d staging -v pw='choose-a-strong-password' \
+--   docker exec -i pg_db psql -U postgres -d <DB_NAME> -v pw='choose-a-strong-password' \
 --     -f - < db/setup-owner-role.sql
 --
 -- Grant surface (the Least-Privilege Rule, ARCHITECTURE_PRINCIPLES.md):
@@ -58,7 +58,8 @@ WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'incident_engine_rw')
 ALTER ROLE incident_engine_rw LOGIN PASSWORD :'pw'
   NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS INHERIT;
 
-GRANT CONNECT ON DATABASE dev TO incident_engine_rw;
+-- CONNECT on the database this script runs in, whatever its name.
+SELECT format('GRANT CONNECT ON DATABASE %I TO incident_engine_rw', current_database()) \gexec
 
 -- ---------------------------------------------------------------------------
 -- OWNED SCHEMA: incidents. Ownership (not grants) is the mechanism — the app
