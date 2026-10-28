@@ -147,7 +147,7 @@ tree) can replace — a `git checkout` in the clone never touches production.
 ```bash
 cd ~/apps/incident-engine
 # re-apply db/schema.sql FIRST if the phase changed it (as superuser), then:
-bash build-release.sh          # refuses a dirty tree; stamps RELEASE_SHA
+bash build-release.sh          # refuses a dirty tree; stamps RELEASE_SHA + RELEASE_AT
 cd /opt/apps/incident-engine && bash preflight-check.sh   # expect zero warnings
 docker compose run --rm app node index.js noop            # release smoke as svc
 ```

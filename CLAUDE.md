@@ -91,16 +91,19 @@ rewrite:
   tree, the release copy points at `/opt/run-logs/incident-engine` via `#RELEASE:LOG_DIR`.
   Filename tag is `${USER_ID}`; `LOGGER_MODE` (`log`/`log_and_console`) gates console
   output. (`RUN_ENV`, `RUN_LOGS_DIR`, `LOGGER` are retired.)
-- **Provenance:** `build-release.sh` stamps `RELEASE_SHA` into the deployed `.env`;
-  every boot logs it in the `env_note` (and on stdout), `dev-tree` when unset. A scheduled
-  run showing `dev-tree` means cron is running the wrong copy.
+- **Provenance:** `build-release.sh` stamps `RELEASE_SHA` and `RELEASE_AT` (UTC,
+  `YYYY-MM-DDTHH:MM:SSZ`, for the orchestrator's release-drift view) into the deployed
+  `.env` — never set either by hand; a dev `.env` has neither. Every boot logs
+  `RELEASE_SHA` in the `env_note` (and on stdout), `dev-tree` when unset; `RELEASE_AT` is
+  not logged. A scheduled run showing `dev-tree` means cron is running the wrong copy.
+  Preflight warns when a release has `RELEASE_SHA` but no (or a malformed) `RELEASE_AT`.
 - **DDL:** house style — `BIGSERIAL` PK, `TIMESTAMPTZ DEFAULT NOW()`, BRIN on time columns,
   **no table partitioning** (mirror `stats.acquisition_history`).
 - **Dispatch:** `node index.js <job>` via a `switch` in `index.js`.
 - **Deploy:** cron-**batch** one-shot in Docker on `pg_net` — **not** a long-running
   service. The editable clone lives at `~/apps/incident-engine`;
   `/opt/apps/incident-engine` is release output produced ONLY by `build-release.sh`
-  (clean-tree guard, `#RELEASE:` overrides, `RELEASE_SHA` stamp). Dev:
+  (clean-tree guard, `#RELEASE:` overrides, `RELEASE_SHA` + `RELEASE_AT` stamp). Dev:
   `RUN_USER=<you> docker compose run --rm app node index.js <job>` from the clone.
   Production: same command from `/opt/apps/incident-engine` with `RUN_USER` omitted
   (entrypoint defaults to svc). See `markdown/DEPLOYMENT.md`.

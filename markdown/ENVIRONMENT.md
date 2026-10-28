@@ -15,6 +15,7 @@ copy-pasteable template.
 | `LOG_DIR` | **Host** side of the run-log mount; code always writes the container path `utils/logger/logs/`. Unset/dev = `./utils/logger/logs` (fails safe, in-tree, gitignored); release = `/opt/run-logs/incident-engine` via `#RELEASE:LOG_DIR`. |
 | `DOCKER_GID` / `UID_0` / `UID_1` / `UID_2` | Host identity build args for the image (docker group gid; svc / jonathan-pope / matt-teixeira uids). Per-server — read from the host, never copied between servers. |
 | `RELEASE_SHA` | **Injected by `build-release.sh` into the deployed `.env` only — never set by hand.** Boot logs it in the `env_note` (`dev-tree` when absent), so every `util.app_run_logs` row records its commit. |
+| `RELEASE_AT` | **Injected by `build-release.sh` beside `RELEASE_SHA` — never set by hand.** Release time, UTC `YYYY-MM-DDTHH:MM:SSZ`, for the orchestrator's release-drift view (the `.env` mtime moves on any edit/copy). Not logged at boot; preflight warns if a release lacks it or it is malformed. |
 | ~~`LOGGER`~~ ~~`RUN_ENV`~~ ~~`RUN_LOGS_DIR`~~ | **Retired 2026-08-26** (paradigm migration). `RUN_ENV`'s unset default was the *production* log path — fail-unsafe; preflight warns if any of these reappear. |
 | `PGHOST` / `PG_HOST` | DB host. In-suite: `pg_db`. (`PGHOST` is tried first, then `PG_HOST`.) |
 | `PGPORT` / `PG_PORT` | DB port (`5432`). |
