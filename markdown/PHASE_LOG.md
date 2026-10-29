@@ -5,6 +5,41 @@ Durable memory of what's been done and why. Newest entry at the top. Add an entr
 
 ---
 
+# Infra — Fleet master logger (run-log names stamped in New York time)
+
+Date: 2026-10-29
+
+Status: Committed on DEV, not released (release is the owner's call)
+
+Out-of-phase fleet change, made by the orchestrator session at the owner's request (owner
+decision 2026-10-29: one `utils/logger/log.js`, byte-identical in 8 apps, master copy in
+`data_acquisition` commit `8726dde`). `utils/logger/log.js` and `utils/logger/log.test.js`
+copied verbatim from that commit (md5 `550a5989…`, `97fb7bb3…`); `enums.js` was already
+identical.
+
+What changes here: the run-log file is named `incident-engine-log.<USER_ID>.<stamp>.json`,
+stamp = run start in America/New_York with ms and offset (e.g.
+`2026-10-29T08-50-51.694-0400`), instead of the run UUID. `run_id` stays a UUID in every
+event and in the self-log row; event `dt` stays UTC. The self-log INSERT still goes
+through `pg_column_sets.util.self_log` (the check-option view): the master uses
+`util.self_log` when an app defines it, else `util.app_run_logs`, so the Write-Isolation
+Rule is unchanged. This copy's early stream-error listener and null-`err` handling are
+in the master. Positional exports unchanged (same order, append-only); `writeLogEvents`
+and `dbInsertLogEvents` still return booleans, so `index.js`'s exit-2 path is unchanged.
+One small difference: a non-Error, non-null `err` is stored as-is in `err_msg` (the old
+copy applied `String(err)`).
+
+Review checklist (walked): no schema, query, role, grant, watermark or assessor change;
+writes unchanged; no new dependency (the logger uses `node:crypto`; `uuid` left in
+place); `.env` untouched. Validation: `npm test` (node --test) in the dev container: 208
+pass, 0 fail, including the 12 logger tests (DST days, midnight, rotation-pattern match,
+name collision, unusable log dir, self_log routing). No live smoke run: no job logic
+changed, and a dev run would add a real self-log row; the first release run is the
+end-to-end check. No Codex handoff: not an implementation phase. Docs:
+`markdown/ENVIRONMENT.md` USER_ID row names the stamp.
+
+---
+
 # Infra — Migration to the fleet dev/release paradigm
 
 Date: 2026-08-26

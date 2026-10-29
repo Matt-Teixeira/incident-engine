@@ -10,7 +10,7 @@ copy-pasteable template.
 | Var | Purpose |
 | --- | --- |
 | `APP_NAME` | Identity for self-logging into `util.app_run_logs`. **Must be `incident-engine`** — `index.js` fails boot on a mismatch, and the DB-side check-option view rejects any other value. |
-| `USER_ID` | Triple duty (fleet convention): image tag (`incident-engine:${USER_ID}`), run-log filename tag (`${APP_NAME}-log.${USER_ID}.${run_id}.json`), boot-note label. Dev = your username; release = `svc` via `#RELEASE:USER_ID=svc`. |
+| `USER_ID` | Triple duty (fleet convention): image tag (`incident-engine:${USER_ID}`), run-log filename tag (`${APP_NAME}-log.${USER_ID}.<stamp>.json`, stamp = run start in New York time, e.g. `2026-10-29T08-50-51.694-0400`), boot-note label. Dev = your username; release = `svc` via `#RELEASE:USER_ID=svc`. |
 | `LOGGER_MODE` | `log` (file only, the release value) or `log_and_console` (adds error stacks + first/last event stats — the dev value). |
 | `LOG_DIR` | **Host** side of the run-log mount; code always writes the container path `utils/logger/logs/`. Unset/dev = `./utils/logger/logs` (fails safe, in-tree, gitignored); release = `/opt/run-logs/incident-engine` via `#RELEASE:LOG_DIR`. |
 | `DOCKER_GID` / `UID_0` / `UID_1` / `UID_2` | Host identity build args for the image (docker group gid; svc / jonathan-pope / matt-teixeira uids). Per-server — read from the host, never copied between servers. |
