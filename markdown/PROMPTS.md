@@ -64,6 +64,12 @@ Later, read-only insight moves to the operator surface: a **dashboard incidents 
   `incidents.incidents`
 - if/when to add the LLM advisory assessor, L4 auto-remediation, notifications, or a bridge
   to the manual `public.network_issues` tracker (all explicitly out of the first increment)
+- a **bounded catch-up mode** for `materialize` (found 2026-10-30, `DEPLOYMENT.md` "First
+  run after a gap"). Today one scan and one transaction hold the whole backlog since the
+  watermark. On acq-vm-2 (8 GiB) that is safe up to about five weeks (~700k events, ~1.7 KB
+  heap per event). A longer gap would hit the 2.2 GB Node heap limit. The candidate shape
+  is a capped `inserted_at` window per transaction, advancing the watermark per slice and
+  looping until caught up. It must keep the aggregate's exactly-once guarantee.
 
 These are decided in future phases, not hidden inside unrelated edits.
 
