@@ -5,6 +5,41 @@ Durable memory of what's been done and why. Newest entry at the top. Add an entr
 
 ---
 
+# Infra — Schedule `run` in the svc crontab at :02/:32; first-run-after-a-gap sizing
+
+Date: 2026-10-30
+
+Status: Docs committed on DEV; cron line and first run are owner actions (not yet run)
+
+Orchestrator request (owner decision 2026-10-30: `run` should be scheduled on acq-vm-2).
+Live facts, read-only, 2026-10-30 ~16:00 UTC: no incident-engine line in the svc crontab
+(35 entries) or the user crontab; `dev` database watermark `util.app_run_logs` =
+2026-10-09 17:53:09Z. The only real runs there are the 2026-10-09 hand-run first
+controlled runs (runbook 4.5, dev tree: materialize 109,507 events in 40s, 280 incidents,
+190 open). Since then only svc `noop` smokes have run.
+
+Decision: the line belongs in the svc crontab (runbook 5.1), not a user crontab as
+DEPLOYMENT.md said. Minute :02/:32: on the RPP spread cadence the producers write at
+:20–:28/:50–:58 (measured per minute over 24h), so the old :25/:55 lands inside the
+Philips burst. :29/:59 was rejected because the :28/:58 Philips runs may still be
+writing. Rationale and table in DEPLOYMENT.md "Cadence".
+
+Catch-up sizing (DEPLOYMENT.md "First run after a gap"): a read-only dry run in the dev
+image (`SET TRANSACTION READ ONLY`, real SCAN_SOURCE_SQL + flattenRun + insert-SQL build
+not executed, domain `nextState` against the live incidents and RECOVERY_SQL; no
+self-log) gave 22,447 rows / 365,113 events, 39s of JS work, peak RSS 815 MB (heap 634 of
+2,240 MB). The full run is estimated at 2.5–3 min. Predicted transitions: 165 open→stale,
+16 open→auto_recovery, 1 resolved→recurring, 329 new incidents (216 open, 53
+auto_recovery, 60 stale). Total 280→609. Finding: materialize has no window cap. One
+scan and one transaction hold the whole backlog, so a gap of more than about five weeks
+on this host needs a bounded catch-up mode that does not exist yet.
+
+Recommended: the owner hand-runs the first `run` from the release copy as svc (so the
+`/tmp` lock file is svc-owned under `fs.protected_regular=2`), then installs the cron
+line with the runbook 5.2 append method. No code, schema, role or release change.
+
+---
+
 # Infra — Fleet master logger (run-log names stamped in New York time)
 
 Date: 2026-10-29

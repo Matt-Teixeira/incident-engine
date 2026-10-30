@@ -43,8 +43,10 @@ Later, read-only insight moves to the operator surface: a **dashboard incidents 
 - reads `warn_error_logs` **only** (never detoasts `verbose_log`); every job is
   **idempotent** (watermark + `ON CONFLICT`)
 - deployed as a **cron-batch one-shot**, not a long-running service
-- **job cadence (decided 2026-07-16):** a single `run` cron line (materialize→assess) at
-  **`25,55`** — half-hourly, just after the producers' bursts finish (~:21/:51). Two
+- **job cadence (decided 2026-07-16; minute moved 2026-10-30):** a single `run` cron line
+  (materialize→assess) in the **svc crontab** at **`02,32`** — half-hourly, after the
+  acq-vm-2 RPP spread-cadence bursts (:20–:28/:50–:58) finish. Was `25,55` in a user
+  crontab while the producers burst at :00/:30 and :15/:45. Two
   staggered lines were rejected: `materialize` and the `assess` aggregate serialize on a
   shared watermark lock, so they cannot run concurrently anyway. See `DEPLOYMENT.md`.
 
