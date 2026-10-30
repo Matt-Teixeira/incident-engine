@@ -9,7 +9,7 @@ Durable memory of what's been done and why. Newest entry at the top. Add an entr
 
 Date: 2026-10-30
 
-Status: Docs committed on DEV; cron line and first run are owner actions (not yet run)
+Status: Completed (first run by hand 16:06 UTC; svc cron line live, first tick 16:32 UTC clean)
 
 Orchestrator request (owner decision 2026-10-30: `run` should be scheduled on acq-vm-2).
 Live facts, read-only, 2026-10-30 ~16:00 UTC: no incident-engine line in the svc crontab
@@ -37,6 +37,16 @@ on this host needs a bounded catch-up mode that does not exist yet.
 Recommended: the owner hand-runs the first `run` from the release copy as svc (so the
 `/tmp` lock file is svc-owned under `fs.protected_regular=2`), then installs the cron
 line with the runbook 5.2 append method. No code, schema, role or release change.
+
+Outcome 2026-10-30: the owner hand-ran `run` as svc from release e9b5cf4. It took 165s
+(materialize 128s, aggregate 36s), inserted 365,114 events and wrote 0 warn/errors.
+Transitions matched the dry run exactly: 216 opened, 1 reopened, 69 auto_recovery,
+225 stale. The result is 609 incidents, 225 open. The owner then appended the cron line
+(backup `/opt/resources/backups/svc-crontab-20261030-1610.txt`; svc crontab 35 -> 36).
+The first scheduled tick ran at 16:32:03: svc, e9b5cf4, 694 ms, 402 events, 1
+auto_recovery, newest last_seen 16:28. Lesson: with `LOGGER_MODE=log` a hand run prints
+only the provenance line and is then silent until it ends, so the owner read it as a
+hang. Warn before a long hand run.
 
 ---
 
